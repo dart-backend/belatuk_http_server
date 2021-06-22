@@ -1,5 +1,9 @@
 # Change Log
 
+## 2.0.1
+
+* Added examples
+
 ## 2.0.0
 
 * Migrated to `belatuk_http_server`

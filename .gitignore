@@ -1,6 +1,3 @@
 .dart_tool
 .packages
-.metals
-.vscode
-.github
 pubspec.lock
