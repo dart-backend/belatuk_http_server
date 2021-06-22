@@ -8,7 +8,7 @@ import 'dart:io';
 import 'dart:mirrors';
 import 'dart:typed_data';
 
-import 'package:http_server/http_server.dart';
+import 'package:belatuk_http_server/belatuk_http_server.dart';
 import 'package:test/test.dart';
 import 'package:test_api/src/backend/invoker.dart';
 

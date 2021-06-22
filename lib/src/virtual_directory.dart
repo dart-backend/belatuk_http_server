@@ -6,7 +6,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:http_server/src/has_current_iterator.dart';
+import 'package:belatuk_http_server/src/has_current_iterator.dart';
 import 'package:mime/mime.dart';
 import 'package:path/path.dart';
 

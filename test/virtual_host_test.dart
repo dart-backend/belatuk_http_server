@@ -6,7 +6,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:test/test.dart';
-import 'package:http_server/http_server.dart';
+import 'package:belatuk_http_server/belatuk_http_server.dart';
 
 import 'utils.dart';
 
