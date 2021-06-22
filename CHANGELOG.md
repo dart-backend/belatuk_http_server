@@ -2,7 +2,7 @@
 
 ## 2.0.1
 
-* Added examples
+* Added example
 
 ## 2.0.0
 
