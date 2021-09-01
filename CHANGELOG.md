@@ -1,5 +1,9 @@
 # Change Log
 
+## 2.0.2
+
+* Transfered repository to `dart-backend`
+
 ## 2.0.1
 
 * Added example
