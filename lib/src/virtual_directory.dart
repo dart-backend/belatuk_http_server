@@ -39,7 +39,7 @@ class VirtualDirectory {
 
   final List<String> _pathPrefixSegments;
 
-  final RegExp _invalidPathRegExp = RegExp('[\\\/\x00]');
+  final RegExp _invalidPathRegExp = RegExp('[\\/\x00]');
 
   void Function(HttpRequest)? _errorCallback;
   void Function(Directory, HttpRequest)? _dirCallback;
