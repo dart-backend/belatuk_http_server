@@ -165,6 +165,8 @@ class VirtualDirectory {
           }
         }
         break;
+      case FileSystemEntityType.notFound:
+        break;
     }
     // Return `null` on fall-through, to indicate NOT_FOUND.
     return null;

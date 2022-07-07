@@ -1,5 +1,10 @@
 # Change Log
 
+## 3.0.0
+
+* Require Dart >= 2.17
+* Fixed analyzer warnings
+
 ## 2.1.0
 
 * Updated linter to `package:lints`
