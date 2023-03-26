@@ -4,7 +4,8 @@
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:io' hide BytesBuilder;
+import 'dart:typed_data';
 
 import 'package:mime/mime.dart';
 

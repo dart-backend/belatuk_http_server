@@ -1,5 +1,10 @@
 # Change Log
 
+## 4.0.0-beta.1
+
+* Require Dart >= 3.0
+* Fixed linter warnings
+
 ## 3.0.0
 
 * Require Dart >= 2.17

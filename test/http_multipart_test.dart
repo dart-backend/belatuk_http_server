@@ -15,7 +15,7 @@ class FormField {
   final String? name;
   // Value of the form field. This is either a String or a List<int> depending
   // on the Content-Type.
-  final value;
+  final dynamic value;
   // Content-Type of the form field.
   final String? contentType;
   // Filename if specified in Content-Disposition.
