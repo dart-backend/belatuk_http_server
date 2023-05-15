@@ -92,7 +92,6 @@ class VirtualDirectory {
         _serveErrorPage(HttpStatus.notFound, request);
       }
     } else if (entity is _DirectoryRedirect) {
-      // TODO(ajohnsen): Use HttpRequest.requestedUri once 1.2 is out.
       _unawaited(request.response.redirect(Uri.parse('${request.uri}/'),
           status: HttpStatus.movedPermanently));
     } else {
@@ -166,6 +165,8 @@ class VirtualDirectory {
         }
         break;
       case FileSystemEntityType.notFound:
+        break;
+      default:
         break;
     }
     // Return `null` on fall-through, to indicate NOT_FOUND.
@@ -392,7 +393,7 @@ http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <title>$encodedReason: $encodedPath</title>
 </head>
 <body>
-<h1>Error $encodedError at \'$encodedPath\': $encodedReason</h1>
+<h1>Error $encodedError at '$encodedPath': $encodedReason</h1>
 $server
 </body>
 </html>''';

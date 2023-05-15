@@ -4,7 +4,7 @@ import 'dart:io';
 import 'package:belatuk_http_server/belatuk_http_server.dart';
 
 void main() async {
-  var server = await HttpServer.bind('localhost', 0);
+  var server = await HttpServer.bind('localhost', 8080);
   server.transform(HttpBodyHandler(defaultEncoding: utf8)).listen((body) {
     switch (body.type) {
       case 'text':

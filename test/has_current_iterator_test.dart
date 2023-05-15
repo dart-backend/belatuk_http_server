@@ -2,20 +2,19 @@ import 'package:belatuk_http_server/src/has_current_iterator.dart';
 import 'package:test/test.dart';
 
 void main() {
-  const mock_first_item = 'foo';
-  const mock_last_item = 'bar';
-  const mock_items = [mock_first_item, mock_last_item];
+  const mockFirstItem = 'foo';
+  const mockLastItem = 'bar';
+  const mockItems = [mockFirstItem, mockLastItem];
   group('When testing hasCurrent', () {
     test('should return false to start', () {
-      final hasCurrentIterator = HasCurrentIterator(mock_items.iterator);
+      final hasCurrentIterator = HasCurrentIterator(mockItems.iterator);
       expect(hasCurrentIterator.hasCurrent, isFalse);
     });
 
     group('With a single item list', () {
-      const mock_single_list = [mock_first_item];
+      const mockSingleList = [mockFirstItem];
       test('Should return true.', () {
-        final hasCurrentIterator =
-            HasCurrentIterator(mock_single_list.iterator);
+        final hasCurrentIterator = HasCurrentIterator(mockSingleList.iterator);
         hasCurrentIterator.moveNext();
         expect(hasCurrentIterator.hasCurrent, isTrue);
       });
@@ -31,7 +30,7 @@ void main() {
 
     group('when iterating beyond the end of the list', () {
       test('should return false', () {
-        final hasCurrentIterator = HasCurrentIterator(mock_items.iterator);
+        final hasCurrentIterator = HasCurrentIterator(mockItems.iterator);
         hasCurrentIterator.moveNext();
         hasCurrentIterator.moveNext();
         hasCurrentIterator.moveNext();
@@ -42,29 +41,29 @@ void main() {
 
   group('When testing current', () {
     test('should return current item', () {
-      final hasCurrentIterator = HasCurrentIterator(mock_items.iterator);
+      final hasCurrentIterator = HasCurrentIterator(mockItems.iterator);
       hasCurrentIterator.moveNext();
-      expect(hasCurrentIterator.current,
-          allOf(isNotEmpty, equals(mock_first_item)));
+      expect(
+          hasCurrentIterator.current, allOf(isNotEmpty, equals(mockFirstItem)));
     });
 
     test('should return last item item', () {
-      final hasCurrentIterator = HasCurrentIterator(mock_items.iterator);
+      final hasCurrentIterator = HasCurrentIterator(mockItems.iterator);
       hasCurrentIterator.moveNext();
       hasCurrentIterator.moveNext();
-      expect(hasCurrentIterator.current,
-          allOf(isNotEmpty, equals(mock_last_item)));
+      expect(
+          hasCurrentIterator.current, allOf(isNotEmpty, equals(mockLastItem)));
     });
   });
 
   group('When testing moveNext', () {
     test('should return true', () {
-      final hasCurrentIterator = HasCurrentIterator(mock_items.iterator);
+      final hasCurrentIterator = HasCurrentIterator(mockItems.iterator);
       expect(hasCurrentIterator.moveNext(), isTrue);
     });
 
     test('should return false', () {
-      final hasCurrentIterator = HasCurrentIterator(mock_items.iterator);
+      final hasCurrentIterator = HasCurrentIterator(mockItems.iterator);
       hasCurrentIterator.moveNext();
       hasCurrentIterator.moveNext();
       expect(hasCurrentIterator.moveNext(), isFalse);
