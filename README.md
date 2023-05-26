@@ -1,7 +1,8 @@
 # Utility classes for HTTP server
 
-[![version](https://img.shields.io/badge/pub-v2.0.12-brightgreen)](https://pub.dartlang.org/packages/belatuk_http_server)
+![Pub Version (including pre-releases)](https://img.shields.io/pub/v/belatuk_http_server?include_prereleases)
 [![Null Safety](https://img.shields.io/badge/null-safety-brightgreen)](https://dart.dev/null-safety)
+[![License](https://img.shields.io/github/license/dart-backend/belatuk_http_server)](https://github.com/dart-backend/belatuk_http_server/blob/master/LICENSE)
 
 **Forked from the archived `http_server` project**
 

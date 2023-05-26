@@ -1,5 +1,9 @@
 # Change Log
 
+## 4.1.1
+
+* Updated README
+
 ## 4.1.0
 
 * Upgraded `test_api` to 0.6.0
