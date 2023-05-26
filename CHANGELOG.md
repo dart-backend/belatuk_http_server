@@ -1,5 +1,9 @@
 # Change Log
 
+## 4.1.0
+
+* Upgraded `test_api` to 0.6.0
+
 ## 4.0.0
 
 * Require Dart >= 3.0
