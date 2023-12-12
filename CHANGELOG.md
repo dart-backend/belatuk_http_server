@@ -1,5 +1,9 @@
 # Change Log
 
+## 4.2.0
+
+* Upgraded `lints` to 3.0.0
+
 ## 4.1.2
 
 * Fixed `_VirtualDirectoryFileStream` class due to change in Dart 3.0.3
