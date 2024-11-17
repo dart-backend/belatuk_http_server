@@ -8,6 +8,4 @@
 
 A set of high-level classes that, together with `HttpServer`, makes is easier to serve web content.
 
-**NOTE:** This package only works for server-side or command-line Dart
-applications. In other words, if the app imports `dart:io`, it can use this
-package.
+**NOTE:** This package only works for server-side or command-line Dart applications. In other words, if the app imports `dart:io`, it can use this package.
