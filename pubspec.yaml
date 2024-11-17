@@ -1,5 +1,5 @@
 name: belatuk_http_server
-version: 4.5.0
+version: 4.5.1
 description: A collection of useful utility classes for building HTTP server.
 repository: https://github.com/dart-backend/belatuk_http_server
 homepage: https://github.com/dart-backend/belatuk_http_server
