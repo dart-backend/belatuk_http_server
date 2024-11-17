@@ -1,8 +1,14 @@
 # Change Log
 
+## 4.5.0
+
+* Require Dart >= 3.5
+* Updated `lints` to 5.0.0
+* Updated `mime` to 2.0.0
+
 ## 4.4.0
 
-* Upgraded `lints` to 4.0.0
+* Updated `lints` to 4.0.0
 
 ## 4.3.0
 
