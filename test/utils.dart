@@ -131,6 +131,53 @@ Future<int> fetchStatusCode(
   }
 }
 
+/// Sends a [method] request for [path], which may include a query, to
+/// [virDir] with extra request [headers], without following redirects, and
+/// returns the response's status code and headers.
+///
+/// Like [statusCodeForVirtDir], this uses a real server or the fakes,
+/// depending on the current test's mode.
+Future<(int, HttpHeaders)> fetchResponse(
+  VirtualDirectory virDir,
+  String path, {
+  String method = 'GET',
+  Map<String, String> headers = const {},
+  DateTime? ifModifiedSince,
+}) async {
+  if (_isFakeTestExpando[currentTestCase]!) {
+    var request = FakeHttpRequest(
+      Uri.parse(path),
+      method: method,
+      followRedirects: false,
+      ifModifiedSince: ifModifiedSince,
+      data: StreamController<Uint8List>().stream,
+    );
+    headers.forEach(request.headers.set);
+    var response = await _withFakeRequest(virDir, request);
+    return (response.statusCode, response.headers);
+  }
+
+  return _withServer(virDir, (port) async {
+    var client = HttpClient();
+    try {
+      var request = await client.openUrl(
+        method,
+        Uri.parse('http://localhost:$port$path'),
+      );
+      request.followRedirects = false;
+      if (ifModifiedSince != null) {
+        request.headers.ifModifiedSince = ifModifiedSince;
+      }
+      headers.forEach(request.headers.set);
+      var response = await request.close();
+      await response.drain<void>();
+      return (response.statusCode, response.headers);
+    } finally {
+      client.close();
+    }
+  });
+}
+
 Future<HttpHeaders> fetchHEaders(
   VirtualDirectory virDir,
   String path, {

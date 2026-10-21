@@ -9,22 +9,19 @@ void main() async {
       .transform(HttpBodyHandler(defaultEncoding: utf8))
       .listen(
         (body) {
+          var response = body.request.response;
           switch (body.type) {
             case 'text':
-              print(body.body);
-              break;
-
             case 'json':
               print(body.body);
-              break;
-
             default:
-              throw StateError('bad body type');
+              response.statusCode = HttpStatus.unsupportedMediaType;
           }
-          body.request.response.close();
+          response.close();
         },
         onError: (Object error) {
-          throw StateError('bad connection');
+          // The request has already been answered with 400 Bad Request.
+          print('Could not parse a request body: $error');
         },
       );
 }

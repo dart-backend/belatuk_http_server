@@ -5,6 +5,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' show min;
 
 import 'package:belatuk_http_server/src/has_current_iterator.dart';
 import 'package:mime/mime.dart';
@@ -46,9 +47,9 @@ class VirtualDirectory {
 
   static List<String> _parsePathPrefix(String? pathPrefix) {
     if (pathPrefix == null) return <String>[];
-    return Uri(
-      path: pathPrefix,
-    ).pathSegments.where((segment) => segment.isNotEmpty).toList();
+    return Uri(path: pathPrefix).pathSegments
+        .where((segment) => segment.isNotEmpty)
+        .toList();
   }
 
   /// Create a new [VirtualDirectory] for serving static file content of the
@@ -71,7 +72,15 @@ class VirtualDirectory {
 
   /// Serve a single [HttpRequest], in this [VirtualDirectory].
   Future serveRequest(HttpRequest request) async {
-    var iterator = HasCurrentIterator(request.uri.pathSegments.iterator);
+    List<String> pathSegments;
+    try {
+      pathSegments = request.uri.pathSegments;
+    } on FormatException {
+      // The path has percent-escapes that are not valid UTF-8.
+      _serveErrorPage(HttpStatus.badRequest, request);
+      return request.response.done;
+    }
+    var iterator = HasCurrentIterator(pathSegments.iterator);
     iterator.moveNext();
     for (var segment in _pathPrefixSegments) {
       if (!iterator.hasCurrent || iterator.current != segment) {
@@ -93,7 +102,7 @@ class VirtualDirectory {
     } else if (entity is _DirectoryRedirect) {
       _unawaited(
         request.response.redirect(
-          Uri.parse('${request.uri}/'),
+          request.uri.replace(path: '${request.uri.path}/'),
           status: HttpStatus.movedPermanently,
         ),
       );
@@ -194,8 +203,7 @@ class VirtualDirectory {
     // TODO(ajohnsen): Set up Zone support for these errors.
     try {
       var lastModified = await file.lastModified();
-      if (request.headers.ifModifiedSince != null &&
-          !lastModified.isAfter(request.headers.ifModifiedSince!)) {
+      if (_isNotModified(request, lastModified)) {
         response.statusCode = HttpStatus.notModified;
         await response.close();
         return null;
@@ -216,12 +224,14 @@ class VirtualDirectory {
           int start; // First byte position - inclusive.
           int end; // Last byte position - inclusive.
           if (matches[1]!.isEmpty) {
-            start = length - int.parse(matches[2]!);
+            start = length - _parseRangeValue(matches[2]!);
             if (start < 0) start = 0;
             end = length - 1;
           } else {
-            start = int.parse(matches[1]!);
-            end = matches[2]!.isEmpty ? length - 1 : int.parse(matches[2]!);
+            start = _parseRangeValue(matches[1]!);
+            end = matches[2]!.isEmpty
+                ? length - 1
+                : _parseRangeValue(matches[2]!);
           }
           // If the range is syntactically invalid the Range header
           // MUST be ignored (RFC 2616 section 14.35.1).
@@ -293,9 +303,32 @@ class VirtualDirectory {
     }
     var response = request.response;
     try {
-      var stats = await dir.stat();
-      if (request.headers.ifModifiedSince != null &&
-          !stats.modified.isAfter(request.headers.ifModifiedSince!)) {
+      // Stat every entry first, so the listing's modification time accounts
+      // for changes to the files in it, not only to the directory itself.
+      var lastModified = (await dir.stat()).modified;
+      var entities = await dir.list(followLinks: true).handleError((_) {
+        // TODO(kevmoo): log error
+      }).toList();
+      var entries = <(FileSystemEntity, FileStat)>[];
+      // Stat the entries in batches, so a large directory neither waits on
+      // each entry in turn nor opens a file handle for every entry at once.
+      for (var i = 0; i < entities.length; i += _statBatchSize) {
+        var batch = entities.sublist(
+          i,
+          min(i + _statBatchSize, entities.length),
+        );
+        var stats = await Future.wait(batch.map(_statOrNull));
+        for (var (index, stat) in stats.indexed) {
+          // The entry was removed while listing, or could not be read.
+          if (stat == null || stat.type == FileSystemEntityType.notFound) {
+            continue;
+          }
+          entries.add((batch[index], stat));
+          if (stat.modified.isAfter(lastModified)) lastModified = stat.modified;
+        }
+      }
+
+      if (_isNotModified(request, lastModified)) {
         response.statusCode = HttpStatus.notModified;
         await response.close();
         return;
@@ -306,8 +339,12 @@ class VirtualDirectory {
         'html',
         parameters: {'charset': 'utf-8'},
       );
-      response.headers.set(HttpHeaders.lastModifiedHeader, stats.modified);
-      var path = Uri.decodeComponent(request.uri.path);
+      response.headers.set(HttpHeaders.lastModifiedHeader, lastModified);
+      if (request.method == 'HEAD') {
+        await response.close();
+        return;
+      }
+      var path = _decodePath(request.uri.path);
       var encodedPath = const HtmlEscape().convert(path);
       var header =
           '''<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
@@ -336,14 +373,13 @@ $server
 
       response.write(header);
 
-      void add(String name, String? modified, var size, bool folder) {
+      void add(String name, String? modified, Object? size, bool folder) {
         size ??= '-';
         modified ??= '';
         var encodedSize = const HtmlEscape().convert(size.toString());
         var encodedModified = const HtmlEscape().convert(modified);
-        var encodedLink = const HtmlEscape(
-          HtmlEscapeMode.attribute,
-        ).convert(Uri.encodeComponent(name));
+        var encodedLink = const HtmlEscape(HtmlEscapeMode.attribute)
+            .convert(Uri.encodeComponent(name));
         if (folder) {
           encodedLink += '/';
           name += '/';
@@ -363,28 +399,24 @@ $server
         add('..', null, null, true);
       }
 
-      dir
-          .list(followLinks: true)
-          .listen(
-            (entity) {
-              var name = basename(entity.path);
-              var stat = entity.statSync();
-              if (entity is File) {
-                add(name, stat.modified.toString(), stat.size, false);
-              } else if (entity is Directory) {
-                add(name, stat.modified.toString(), null, true);
-              }
-            },
-            onError: (e) {
-              // TODO(kevmoo): log error
-            },
-            onDone: () {
-              response.write(footer);
-              response.close();
-            },
-          );
+      for (var (entity, stat) in entries) {
+        var name = basename(entity.path);
+        if (entity is File) {
+          add(name, stat.modified.toString(), stat.size, false);
+        } else if (entity is Directory) {
+          add(name, stat.modified.toString(), null, true);
+        }
+      }
+
+      response.write(footer);
+      await response.close();
     } catch (_) {
       // TODO(kevmoo): log error
+      try {
+        response.statusCode = HttpStatus.internalServerError;
+      } on StateError {
+        // Part of the listing was already sent.
+      }
       await response.close();
     }
   }
@@ -402,7 +434,7 @@ $server
       parameters: {'charset': 'utf-8'},
     );
     // Default error page.
-    var path = Uri.decodeComponent(request.uri.path);
+    var path = _decodePath(request.uri.path);
     var encodedPath = const HtmlEscape().convert(path);
     var encodedReason = const HtmlEscape().convert(response.reasonPhrase);
     var encodedError = const HtmlEscape().convert(error.toString());
@@ -484,6 +516,46 @@ class _VirtualDirectoryFileStream implements StreamConsumer<List<int>> {
     }
   }
 }
+
+/// Decodes a request [path] for display, keeping it as it is if its
+/// percent-escapes are not valid UTF-8.
+String _decodePath(String path) {
+  try {
+    return Uri.decodeComponent(path);
+  } on FormatException {
+    return path;
+  }
+}
+
+/// Stats [entity], or returns `null` if it cannot be read.
+Future<FileStat?> _statOrNull(FileSystemEntity entity) async {
+  try {
+    return await entity.stat();
+  } on FileSystemException {
+    return null;
+  }
+}
+
+/// Whether a resource last modified at [modified] is unchanged since the
+/// request's `If-Modified-Since` date.
+///
+/// HTTP dates have a resolution of one second, so [modified] is truncated to
+/// whole seconds before comparing.
+bool _isNotModified(HttpRequest request, DateTime modified) {
+  var since = request.headers.ifModifiedSince;
+  if (since == null) return false;
+  var milliseconds = modified.millisecondsSinceEpoch;
+  // Round down to the second, including for times before 1970.
+  var seconds = milliseconds - milliseconds % 1000;
+  return seconds <= since.millisecondsSinceEpoch;
+}
+
+/// How many directory entries to stat at a time when listing a directory.
+const _statBatchSize = 64;
+
+/// Parses a byte position from a `Range` header, treating a number too large
+/// for an [int] as larger than any file.
+int _parseRangeValue(String value) => int.tryParse(value) ?? 0x7FFFFFFFFFFFFFFF;
 
 // Copied from `package:pedantic` to avoid the dep.
 void _unawaited(Future<void> f) {}

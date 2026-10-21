@@ -159,7 +159,7 @@ void _testHttpServerRequestBody() {
       if (shouldFail) {
         expect(response.statusCode, equals(HttpStatus.badRequest));
       }
-      return response.drain();
+      return await response.drain();
     } catch (_) {
       if (!shouldFail) rethrow;
     } finally {
@@ -306,6 +306,11 @@ File content\r
 
   check('application/x-www-form-urlencoded', 'a=%C3%B8+%C8%A4'.codeUnits, {
     'a': 'ø Ȥ',
+  }, 'form');
+  // Raw UTF-8 that the client did not percent-encode.
+  check('application/x-www-form-urlencoded', utf8.encode('name=José&a=b+c'), {
+    'name': 'José',
+    'a': 'b c',
   }, 'form');
 
   check(

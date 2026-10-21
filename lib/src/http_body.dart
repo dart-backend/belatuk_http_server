@@ -105,8 +105,7 @@ class HttpBodyHandler
   /// [defaultEncoding] accordingly. This is required for parsing
   /// `multipart/form-data` content correctly. See the class comment
   /// for more information on `multipart/form-data`.
-  HttpBodyHandler({Encoding defaultEncoding = utf8})
-    : _defaultEncoding = defaultEncoding;
+  HttpBodyHandler({this._defaultEncoding = utf8});
 
   /// Process and parse an incoming [HttpRequest].
   ///
@@ -246,10 +245,7 @@ Future<HttpBody> _process(
   var contentType = headers.contentType!;
 
   Future<HttpBody> asText(Encoding defaultEncoding) async {
-    Encoding? encoding;
-    var charset = contentType.charset;
-    if (charset != null) encoding = Encoding.getByName(charset);
-    encoding ??= defaultEncoding;
+    var encoding = _encodingFor(contentType, defaultEncoding);
     var buffer = await encoding.decoder
         .bind(stream)
         .fold(StringBuffer(), (dynamic buffer, data) => buffer..write(data));
@@ -257,46 +253,49 @@ Future<HttpBody> _process(
   }
 
   Future<HttpBody> asFormData() async {
-    var values =
-        await MimeMultipartTransformer(contentType.parameters['boundary']!)
-            .bind(stream)
-            .map(
-              (part) => HttpMultipartFormData.parse(
-                part,
-                defaultEncoding: defaultEncoding,
-              ),
-            )
-            .map((multipart) async {
-              dynamic data;
-              if (multipart.isText) {
-                var buffer = await multipart.fold<StringBuffer>(
-                  StringBuffer(),
-                  (b, s) => b..write(s),
-                );
-                data = buffer.toString();
-              } else {
-                var buffer = await multipart.fold<BytesBuilder>(
-                  BytesBuilder(),
-                  (b, d) => b..add(d as List<int>),
-                );
-                data = buffer.takeBytes();
-              }
-              var filename =
-                  multipart.contentDisposition.parameters['filename'];
-              if (filename != null) {
-                data = HttpBodyFileUpload._(
-                  multipart.contentType,
-                  filename,
-                  data,
-                );
-              }
-              return [multipart.contentDisposition.parameters['name'], data];
-            })
-            .toList();
-    var parts = await Future.wait(values);
+    var boundary = contentType.parameters['boundary'];
+    if (boundary == null) {
+      throw HttpException('The multipart/form-data body has no boundary.');
+    }
+    // Parts are handled one at a time, in order, so that an invalid part fails
+    // the whole body instead of escaping as an uncaught error.
+    var parts = await MimeMultipartTransformer(boundary)
+        .bind(stream)
+        .map(
+          (part) => HttpMultipartFormData.parse(
+            part,
+            defaultEncoding: defaultEncoding,
+          ),
+        )
+        .asyncMap((multipart) async {
+          var name = multipart.contentDisposition.parameters['name'];
+          if (name == null) {
+            throw HttpException('A multipart/form-data part has no name.');
+          }
+          dynamic data;
+          if (multipart.isText) {
+            var buffer = await multipart.fold<StringBuffer>(
+              StringBuffer(),
+              (b, s) => b..write(s),
+            );
+            data = buffer.toString();
+          } else {
+            var buffer = await multipart.fold<BytesBuilder>(
+              BytesBuilder(),
+              (b, d) => b..add(d as List<int>),
+            );
+            data = buffer.takeBytes();
+          }
+          var filename = multipart.contentDisposition.parameters['filename'];
+          if (filename != null) {
+            data = HttpBodyFileUpload._(multipart.contentType, filename, data);
+          }
+          return (name, data);
+        })
+        .toList();
     var map = <String, dynamic>{};
-    for (var part in parts) {
-      map[part[0] as String] = part[1]; // Override existing entries.
+    for (var (name, data) in parts) {
+      map[name] = data; // Override existing entries.
     }
     return HttpBody._('form', map);
   }
@@ -312,10 +311,13 @@ Future<HttpBody> _process(
           return HttpBody._('json', jsonDecode(body.body as String));
 
         case 'x-www-form-urlencoded':
-          var body = await asText(ascii);
+          // Decode the body and its percent-escapes with the same encoding:
+          // the request's charset, or the default if it has none.
+          var encoding = _encodingFor(contentType, defaultEncoding);
+          var body = await asText(encoding);
           var map = Uri.splitQueryString(
-            body.body as String,
-            encoding: defaultEncoding,
+            _percentEncodeNonAscii(body.body as String, encoding),
+            encoding: encoding,
           );
           var result = {};
           for (var key in map.keys) {
@@ -344,3 +346,25 @@ Future<HttpBody> _process(
 
   return asBinary();
 }
+
+/// The encoding named by [contentType]'s charset, or [defaultEncoding] if it
+/// names none that is known.
+Encoding _encodingFor(ContentType contentType, Encoding defaultEncoding) {
+  var charset = contentType.charset;
+  return (charset == null ? null : Encoding.getByName(charset)) ??
+      defaultEncoding;
+}
+
+/// Percent-encodes the non-ASCII characters in a form-urlencoded [body], so
+/// that a client that sent them raw is decoded the same as one that escaped
+/// them.
+String _percentEncodeNonAscii(String body, Encoding encoding) =>
+    body.replaceAllMapped(
+      _nonAsciiRun,
+      (match) => encoding
+          .encode(match[0]!)
+          .map((byte) => '%${byte.toRadixString(16).padLeft(2, '0')}')
+          .join(),
+    );
+
+final _nonAsciiRun = RegExp(r'[^\x00-\x7F]+');
