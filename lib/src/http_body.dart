@@ -41,8 +41,9 @@ import 'http_multipart_form_data.dart';
 /// splitting a query string. The resulting body is a `Map<String,
 /// String>`.  If the same name is present several times in the query
 /// string, then the last value seen for this name will be in the
-/// resulting map. The encoding US-ASCII is always used for decoding
-/// the body.
+/// resulting map. The 'charset' parameter of the content type specifies
+/// the encoding used for decoding both the body and its percent-escapes.
+/// If no 'charset' is present the default encoding is used.
 ///
 /// For content type `multipart/form-data` the body is parsed into
 /// it's different fields. The resulting body is a `Map<String,
@@ -230,13 +231,16 @@ Future<HttpBody> _process(
   HttpHeaders headers,
   Encoding defaultEncoding,
 ) async {
-  Future<HttpBody> asBinary() async {
+  Future<Uint8List> collectBytes() async {
     var builder = await stream.fold<BytesBuilder>(
       BytesBuilder(),
       (builder, data) => builder..add(data),
     );
-    return HttpBody._('binary', builder.takeBytes());
+    return builder.takeBytes();
   }
+
+  Future<HttpBody> asBinary() async =>
+      HttpBody._('binary', await collectBytes());
 
   if (headers.contentType == null) {
     return asBinary();
@@ -244,8 +248,7 @@ Future<HttpBody> _process(
 
   var contentType = headers.contentType!;
 
-  Future<HttpBody> asText(Encoding defaultEncoding) async {
-    var encoding = _encodingFor(contentType, defaultEncoding);
+  Future<HttpBody> asText(Encoding encoding) async {
     var buffer = await encoding.decoder
         .bind(stream)
         .fold(StringBuffer(), (dynamic buffer, data) => buffer..write(data));
@@ -302,28 +305,22 @@ Future<HttpBody> _process(
 
   switch (contentType.primaryType) {
     case 'text':
-      return asText(defaultEncoding);
+      return asText(_encodingFor(contentType, defaultEncoding));
 
     case 'application':
       switch (contentType.subType) {
         case 'json':
-          var body = await asText(utf8);
+          var body = await asText(_encodingFor(contentType, utf8));
           return HttpBody._('json', jsonDecode(body.body as String));
 
         case 'x-www-form-urlencoded':
-          // Decode the body and its percent-escapes with the same encoding:
-          // the request's charset, or the default if it has none.
-          var encoding = _encodingFor(contentType, defaultEncoding);
-          var body = await asText(encoding);
-          var map = Uri.splitQueryString(
-            _percentEncodeNonAscii(body.body as String, encoding),
-            encoding: encoding,
+          var map = _parseUrlEncoded(
+            await collectBytes(),
+            _encodingFor(contentType, defaultEncoding),
           );
-          var result = {};
-          for (var key in map.keys) {
-            result[key] = map[key];
-          }
-          return HttpBody._('form', result);
+          // An untyped map, as in earlier releases, so callers can still add
+          // values of other types to it.
+          return HttpBody._('form', <dynamic, dynamic>{...map});
 
         default:
           break;
@@ -355,16 +352,71 @@ Encoding _encodingFor(ContentType contentType, Encoding defaultEncoding) {
       defaultEncoding;
 }
 
-/// Percent-encodes the non-ASCII characters in a form-urlencoded [body], so
-/// that a client that sent them raw is decoded the same as one that escaped
-/// them.
-String _percentEncodeNonAscii(String body, Encoding encoding) =>
-    body.replaceAllMapped(
-      _nonAsciiRun,
-      (match) => encoding
-          .encode(match[0]!)
-          .map((byte) => '%${byte.toRadixString(16).padLeft(2, '0')}')
-          .join(),
-    );
+const _ampersand = 0x26, _equals = 0x3D, _plus = 0x2B, _percent = 0x25;
+const _space = 0x20;
 
-final _nonAsciiRun = RegExp(r'[^\x00-\x7F]+');
+/// Parses an `application/x-www-form-urlencoded` body.
+///
+/// The body is split into names and values as raw bytes, and each one is
+/// decoded once with [encoding], so the request's charset applies both to
+/// percent-escapes and to characters the client did not escape. As with
+/// [Uri.splitQueryString], a later value for a name replaces an earlier one, a
+/// name without `=` has an empty value, and an empty name is skipped.
+Map<String, String> _parseUrlEncoded(Uint8List body, Encoding encoding) {
+  var map = <String, String>{};
+  for (var start = 0; start < body.length;) {
+    var end = body.indexOf(_ampersand, start);
+    if (end == -1) end = body.length;
+    var equals = start;
+    while (equals < end && body[equals] != _equals) {
+      equals++;
+    }
+    if (equals == end) {
+      if (end > start) {
+        map[_decodeFormComponent(body, start, end, encoding)] = '';
+      }
+    } else if (equals > start) {
+      map[_decodeFormComponent(body, start, equals, encoding)] =
+          _decodeFormComponent(body, equals + 1, end, encoding);
+    }
+    start = end + 1;
+  }
+  return map;
+}
+
+/// Decodes the name or value in `bytes[start..end)`: `+` is a space, `%XX`
+/// is the byte `XX`, and the resulting bytes are decoded with [encoding].
+String _decodeFormComponent(
+  Uint8List bytes,
+  int start,
+  int end,
+  Encoding encoding,
+) {
+  var decoded = Uint8List(end - start);
+  var length = 0;
+  for (var i = start; i < end; i++) {
+    var byte = bytes[i];
+    if (byte == _plus) {
+      decoded[length++] = _space;
+    } else if (byte == _percent) {
+      var high = i + 1 < end ? _hexValue(bytes[i + 1]) : -1;
+      var low = i + 2 < end ? _hexValue(bytes[i + 2]) : -1;
+      if (high < 0 || low < 0) {
+        throw const FormatException('Invalid percent-escape in a form body.');
+      }
+      decoded[length++] = high * 16 + low;
+      i += 2;
+    } else {
+      decoded[length++] = byte;
+    }
+  }
+  return encoding.decode(Uint8List.sublistView(decoded, 0, length));
+}
+
+/// The value of the hex digit [char], or -1 if it is not one.
+int _hexValue(int char) {
+  if (char >= 0x30 && char <= 0x39) return char - 0x30; // 0-9
+  if (char >= 0x41 && char <= 0x46) return char - 0x41 + 10; // A-F
+  if (char >= 0x61 && char <= 0x66) return char - 0x61 + 10; // a-f
+  return -1;
+}

@@ -9,15 +9,10 @@ void main() async {
       .transform(HttpBodyHandler(defaultEncoding: utf8))
       .listen(
         (body) {
-          var response = body.request.response;
-          switch (body.type) {
-            case 'text':
-            case 'json':
-              print(body.body);
-            default:
-              response.statusCode = HttpStatus.unsupportedMediaType;
-          }
-          response.close();
+          // `type` is 'text', 'json', 'form' (urlencoded or multipart) or
+          // 'binary'.
+          print('${body.type}: ${body.body}');
+          body.request.response.close();
         },
         onError: (Object error) {
           // The request has already been answered with 400 Bad Request.

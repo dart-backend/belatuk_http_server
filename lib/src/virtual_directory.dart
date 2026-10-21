@@ -102,7 +102,7 @@ class VirtualDirectory {
     } else if (entity is _DirectoryRedirect) {
       _unawaited(
         request.response.redirect(
-          request.uri.replace(path: '${request.uri.path}/'),
+          _trailingSlashRedirect(request.uri),
           status: HttpStatus.movedPermanently,
         ),
       );
@@ -124,7 +124,9 @@ class VirtualDirectory {
   /// Overrides the default error handle.
   ///
   /// When [callback] is invoked, the `statusCode` property of the response is
-  /// set.
+  /// set. The [callback] must close the response. If it throws, the response
+  /// is closed and the error is ignored; an asynchronous [callback] must handle
+  /// its own errors.
   set errorPageHandler(void Function(HttpRequest) callback) {
     _errorCallback = callback;
   }
@@ -417,7 +419,11 @@ $server
       } on StateError {
         // Part of the listing was already sent.
       }
-      await response.close();
+      try {
+        await response.close();
+      } catch (_) {
+        // The client disconnected, so there is nobody to respond to.
+      }
     }
   }
 
@@ -425,7 +431,12 @@ $server
     var response = request.response;
     response.statusCode = error;
     if (_errorCallback != null) {
-      _errorCallback!(request);
+      try {
+        _errorCallback!(request);
+      } catch (_) {
+        // A failing handler must not leave the client waiting.
+        _unawaited(response.close().catchError((_) {}));
+      }
       return;
     }
     response.headers.contentType = ContentType(
@@ -516,6 +527,17 @@ class _VirtualDirectoryFileStream implements StreamConsumer<List<int>> {
     }
   }
 }
+
+/// The location that adds a trailing slash to the directory at [uri].
+///
+/// Only the path and query are kept, and leading slashes are collapsed to one,
+/// so a request like `//other.host/dir` cannot redirect to another host.
+Uri _trailingSlashRedirect(Uri uri) => Uri(
+  path: '/${uri.path.replaceFirst(_leadingSlashes, '')}/',
+  query: uri.hasQuery ? uri.query : null,
+);
+
+final _leadingSlashes = RegExp('^/+');
 
 /// Decodes a request [path] for display, keeping it as it is if its
 /// percent-escapes are not valid UTF-8.
