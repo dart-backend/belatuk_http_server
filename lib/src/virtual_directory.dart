@@ -5,7 +5,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' show min;
+import 'dart:math' show max, min;
 
 import 'package:belatuk_http_server/src/has_current_iterator.dart';
 import 'package:mime/mime.dart';
@@ -42,7 +42,7 @@ class VirtualDirectory {
 
   final RegExp _invalidPathRegExp = RegExp('[\\/\x00]');
 
-  void Function(HttpRequest)? _errorCallback;
+  FutureOr<void> Function(HttpRequest)? _errorCallback;
   void Function(Directory, HttpRequest)? _dirCallback;
 
   static List<String> _parsePathPrefix(String? pathPrefix) {
@@ -124,10 +124,10 @@ class VirtualDirectory {
   /// Overrides the default error handle.
   ///
   /// When [callback] is invoked, the `statusCode` property of the response is
-  /// set. The [callback] must close the response. If it throws, the response
-  /// is closed and the error is ignored; an asynchronous [callback] must handle
-  /// its own errors.
-  set errorPageHandler(void Function(HttpRequest) callback) {
+  /// set. The [callback] must close the response. If it throws, or returns a
+  /// future that completes with an error, the response is closed and the
+  /// error is ignored.
+  set errorPageHandler(FutureOr<void> Function(HttpRequest) callback) {
     _errorCallback = callback;
   }
 
@@ -219,35 +219,45 @@ class VirtualDirectory {
       if (range != null) {
         // We only support one range, where the standard support several.
         var matches = RegExp(r'^bytes=(\d*)\-(\d*)$').firstMatch(range);
-        // If the range header have the right format, handle it.
+        // If the range header have the right format, handle it. An empty
+        // file has no satisfiable ranges, so the Range header is ignored for
+        // it instead (RFC 9110 section 14.2).
         if (matches != null &&
+            length > 0 &&
             (matches[1]!.isNotEmpty || matches[2]!.isNotEmpty)) {
+          var first = matches[1]!;
+          var last = matches[2]!;
           // Serve sub-range.
           int start; // First byte position - inclusive.
           int end; // Last byte position - inclusive.
-          if (matches[1]!.isEmpty) {
-            start = length - _parseRangeValue(matches[2]!);
-            if (start < 0) start = 0;
+          bool satisfiable;
+          if (first.isEmpty) {
+            // A suffix range, for the last bytes of the file.
+            var suffixLength = _parseRangeValue(last);
+            start = max(0, length - suffixLength);
             end = length - 1;
+            satisfiable = suffixLength > 0;
           } else {
-            start = _parseRangeValue(matches[1]!);
-            end = matches[2]!.isEmpty
+            start = _parseRangeValue(first);
+            end = last.isEmpty
                 ? length - 1
-                : _parseRangeValue(matches[2]!);
+                : min(_parseRangeValue(last), length - 1);
+            satisfiable = start < length;
           }
-          // If the range is syntactically invalid the Range header
-          // MUST be ignored (RFC 2616 section 14.35.1).
-          if (start <= end) {
-            if (end >= length) {
-              end = length - 1;
-            }
-
-            if (start >= length) {
-              response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
-              await response.close();
-              return;
-            }
-
+          // A range that ends before it starts is invalid, and the Range
+          // header MUST be ignored (RFC 9110 section 14.1.1).
+          var invalid =
+              first.isNotEmpty &&
+              last.isNotEmpty &&
+              _parseRangeValue(last) < start;
+          if (!invalid && !satisfiable) {
+            response
+              ..statusCode = HttpStatus.requestedRangeNotSatisfiable
+              ..headers.set(HttpHeaders.contentRangeHeader, 'bytes */$length');
+            await response.close();
+            return;
+          }
+          if (!invalid) {
             // Override Content-Length with the actual bytes sent.
             response.headers.set(
               HttpHeaders.contentLengthHeader,
@@ -308,9 +318,17 @@ class VirtualDirectory {
       // Stat every entry first, so the listing's modification time accounts
       // for changes to the files in it, not only to the directory itself.
       var lastModified = (await dir.stat()).modified;
-      var entities = await dir.list(followLinks: true).handleError((_) {
-        // TODO(kevmoo): log error
-      }).toList();
+      var entities = await dir.list(followLinks: true).handleError(
+        (_) {
+          // TODO(kevmoo): log error
+        },
+        // An entry that cannot be read is left out, but a directory that
+        // cannot be listed at all fails the listing.
+        test: (error) =>
+            error is! FileSystemException ||
+            error.path == null ||
+            !equals(error.path!, dir.path),
+      ).toList();
       var entries = <(FileSystemEntity, FileStat)>[];
       // Stat the entries in batches, so a large directory neither waits on
       // each entry in turn nor opens a file handle for every entry at once.
@@ -431,12 +449,13 @@ $server
     var response = request.response;
     response.statusCode = error;
     if (_errorCallback != null) {
-      try {
-        _errorCallback!(request);
-      } catch (_) {
-        // A failing handler must not leave the client waiting.
-        _unawaited(response.close().catchError((_) {}));
-      }
+      var callback = _errorCallback!;
+      _unawaited(
+        Future.sync(() => callback(request)).catchError(
+          // A failing handler must not leave the client waiting.
+          (_) => response.close().catchError((_) {}),
+        ),
+      );
       return;
     }
     response.headers.contentType = ContentType(

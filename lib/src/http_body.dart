@@ -32,18 +32,20 @@ import 'http_multipart_form_data.dart';
 ///
 /// For content type `application/json` the body is decoded into a
 /// string which is then parsed as JSON. The resulting body is a
-/// [Map].  The 'charset' parameter of the content type specifies the
-/// encoding used for decoding. If no 'charset' is present the default
-/// encoding of UTF-8 is used.
+/// [Map]. The body is always decoded as UTF-8, as RFC 8259 requires, and
+/// the 'charset' parameter of the content type is ignored. A leading byte
+/// order mark is ignored.
 ///
 /// For content type `application/x-www-form-urlencoded` the body is a
 /// query string which is then split according to the rules for
 /// splitting a query string. The resulting body is a `Map<String,
 /// String>`.  If the same name is present several times in the query
 /// string, then the last value seen for this name will be in the
-/// resulting map. The 'charset' parameter of the content type specifies
-/// the encoding used for decoding both the body and its percent-escapes.
-/// If no 'charset' is present the default encoding is used.
+/// resulting map. The body must be ASCII, with any other character
+/// percent-encoded as UTF-8, as in the URL Standard, so the 'charset'
+/// parameter of the content type is ignored. A body with raw non-ASCII bytes,
+/// or with percent-escapes that are not UTF-8, is rejected, and
+/// [processRequest] responds with 400 Bad Request.
 ///
 /// For content type `multipart/form-data` the body is parsed into
 /// it's different fields. The resulting body is a `Map<String,
@@ -310,14 +312,15 @@ Future<HttpBody> _process(
     case 'application':
       switch (contentType.subType) {
         case 'json':
-          var body = await asText(_encodingFor(contentType, utf8));
-          return HttpBody._('json', jsonDecode(body.body as String));
+          // JSON is always UTF-8 and has no charset parameter (RFC 8259,
+          // section 8.1), so any charset given is ignored. A leading byte
+          // order mark is allowed to be ignored, and is.
+          var text = (await asText(utf8)).body as String;
+          if (text.startsWith('\uFEFF')) text = text.substring(1);
+          return HttpBody._('json', jsonDecode(text));
 
         case 'x-www-form-urlencoded':
-          var map = _parseUrlEncoded(
-            await collectBytes(),
-            _encodingFor(contentType, defaultEncoding),
-          );
+          var map = _parseUrlEncoded(await collectBytes());
           // An untyped map, as in earlier releases, so callers can still add
           // values of other types to it.
           return HttpBody._('form', <dynamic, dynamic>{...map});
@@ -353,16 +356,16 @@ Encoding _encodingFor(ContentType contentType, Encoding defaultEncoding) {
 }
 
 const _ampersand = 0x26, _equals = 0x3D, _plus = 0x2B, _percent = 0x25;
-const _space = 0x20;
+const _space = 0x20, _maxAscii = 0x7F;
 
 /// Parses an `application/x-www-form-urlencoded` body.
 ///
 /// The body is split into names and values as raw bytes, and each one is
-/// decoded once with [encoding], so the request's charset applies both to
-/// percent-escapes and to characters the client did not escape. As with
+/// percent-decoded and then decoded as UTF-8, as in the URL Standard. Raw
+/// bytes must be ASCII. As with
 /// [Uri.splitQueryString], a later value for a name replaces an earlier one, a
 /// name without `=` has an empty value, and an empty name is skipped.
-Map<String, String> _parseUrlEncoded(Uint8List body, Encoding encoding) {
+Map<String, String> _parseUrlEncoded(Uint8List body) {
   var map = <String, String>{};
   for (var start = 0; start < body.length;) {
     var end = body.indexOf(_ampersand, start);
@@ -373,11 +376,14 @@ Map<String, String> _parseUrlEncoded(Uint8List body, Encoding encoding) {
     }
     if (equals == end) {
       if (end > start) {
-        map[_decodeFormComponent(body, start, end, encoding)] = '';
+        map[_decodeFormComponent(body, start, end)] = '';
       }
     } else if (equals > start) {
-      map[_decodeFormComponent(body, start, equals, encoding)] =
-          _decodeFormComponent(body, equals + 1, end, encoding);
+      map[_decodeFormComponent(body, start, equals)] = _decodeFormComponent(
+        body,
+        equals + 1,
+        end,
+      );
     }
     start = end + 1;
   }
@@ -385,13 +391,8 @@ Map<String, String> _parseUrlEncoded(Uint8List body, Encoding encoding) {
 }
 
 /// Decodes the name or value in `bytes[start..end)`: `+` is a space, `%XX`
-/// is the byte `XX`, and the resulting bytes are decoded with [encoding].
-String _decodeFormComponent(
-  Uint8List bytes,
-  int start,
-  int end,
-  Encoding encoding,
-) {
+/// is the byte `XX`, and the resulting bytes are decoded as UTF-8.
+String _decodeFormComponent(Uint8List bytes, int start, int end) {
   var decoded = Uint8List(end - start);
   var length = 0;
   for (var i = start; i < end; i++) {
@@ -406,11 +407,15 @@ String _decodeFormComponent(
       }
       decoded[length++] = high * 16 + low;
       i += 2;
+    } else if (byte > _maxAscii) {
+      throw const FormatException(
+        'A form body has a non-ASCII byte that is not percent-encoded.',
+      );
     } else {
       decoded[length++] = byte;
     }
   }
-  return encoding.decode(Uint8List.sublistView(decoded, 0, length));
+  return utf8.decode(Uint8List.sublistView(decoded, 0, length));
 }
 
 /// The value of the hex digit [char], or -1 if it is not one.

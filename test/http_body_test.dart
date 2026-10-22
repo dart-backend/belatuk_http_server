@@ -216,6 +216,34 @@ Future<void> _testHttpServerRequestBody() async {
     'json',
     shouldFail: true,
   );
+  // JSON is always UTF-8, whatever charset the request declares.
+  await check(
+    'application/json; charset=iso-8859-1',
+    utf8.encode('{"val": "é"}'),
+    {'val': 'é'},
+    'json',
+  );
+  await check(
+    'application/json; charset=us-ascii',
+    utf8.encode('{"val": "é"}'),
+    {'val': 'é'},
+    'json',
+    defaultEncoding: latin1,
+  );
+  // A leading byte order mark is ignored.
+  await check(
+    'application/json',
+    [0xEF, 0xBB, 0xBF, ...'{"val": 5}'.codeUnits],
+    {'val': 5},
+    'json',
+  );
+  await check(
+    'application/json',
+    [...'{"val": "'.codeUnits, 0xE9, ...'"}'.codeUnits],
+    null,
+    'json',
+    shouldFail: true,
+  );
 
   await check(null, 'body'.codeUnits, 'body'.codeUnits, 'binary');
 
@@ -344,12 +372,45 @@ File content\r
     {'a': 'ø Ȥ'},
     'form',
   );
-  // The charset applies to both raw characters and percent-escapes.
+  // Percent-escapes are UTF-8, whatever the charset.
   await check(
-    'application/x-www-form-urlencoded; charset=utf-8',
-    utf8.encode('raw=€&escaped=%C3%A9'),
-    {'raw': '€', 'escaped': 'é'},
+    'application/x-www-form-urlencoded; charset=iso-8859-1',
+    'name=%C3%A9'.codeUnits,
+    {'name': 'é'},
     'form',
+    defaultEncoding: latin1,
+  );
+  // Raw non-ASCII bytes are rejected with 400 Bad Request, whatever the
+  // charset.
+  for (var (mimeType, raw) in [
+    ('application/x-www-form-urlencoded', utf8.encode('name=José')),
+    ('application/x-www-form-urlencoded; charset=utf-8', utf8.encode('€=1')),
+    (
+      'application/x-www-form-urlencoded; charset=iso-8859-1',
+      [...'name='.codeUnits, 0xE9],
+    ),
+    // Part of a character percent-encoded and part not.
+    (
+      'application/x-www-form-urlencoded; charset=utf-8',
+      [...'name='.codeUnits, 0xC3, ...'%A9'.codeUnits],
+    ),
+  ]) {
+    await check(mimeType, raw, null, 'form', error: isA<FormatException>());
+  }
+  // A percent-escape that is not UTF-8 fails, whatever the charset.
+  await check(
+    'application/x-www-form-urlencoded; charset=iso-8859-1',
+    'name=%E9'.codeUnits,
+    null,
+    'form',
+    shouldFail: true,
+  );
+  await check(
+    'application/x-www-form-urlencoded',
+    'name=%E9'.codeUnits,
+    null,
+    'form',
+    shouldFail: true,
     defaultEncoding: latin1,
   );
 
@@ -375,17 +436,16 @@ File content\r
     error: isA<HttpException>(),
   );
 
-  // Raw UTF-8 that the client did not percent-encode.
   await check(
     'application/x-www-form-urlencoded',
-    utf8.encode('name=José&a=b+c'),
+    'name=Jos%C3%A9&a=b+c'.codeUnits,
     {'name': 'José', 'a': 'b c'},
     'form',
   );
 
   await check(
     'application/x-www-form-urlencoded',
-    'a=%F8+%26%23548%3B'.codeUnits,
+    'a=%C3%B8+%26%23548%3B'.codeUnits,
     {'a': 'ø &#548;'},
     'form',
     defaultEncoding: latin1,
@@ -401,7 +461,7 @@ File content\r
 
   await check(
     'application/x-www-form-urlencoded',
-    'name=%F8%26'.codeUnits,
+    'name=%C3%B8%26'.codeUnits,
     {'name': 'ø&'},
     'form',
     defaultEncoding: latin1,
