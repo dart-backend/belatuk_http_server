@@ -126,7 +126,11 @@ class HttpBodyHandler
     } catch (e) {
       // Try to send BAD_REQUEST response.
       request.response.statusCode = HttpStatus.badRequest;
-      await request.response.close();
+      try {
+        await request.response.close();
+      } catch (_) {
+        // The client disconnected; the error to report is the original one.
+      }
       rethrow;
     }
   }
@@ -320,10 +324,7 @@ Future<HttpBody> _process(
           return HttpBody._('json', jsonDecode(text));
 
         case 'x-www-form-urlencoded':
-          var map = _parseUrlEncoded(await collectBytes());
-          // An untyped map, as in earlier releases, so callers can still add
-          // values of other types to it.
-          return HttpBody._('form', <dynamic, dynamic>{...map});
+          return HttpBody._('form', _parseUrlEncoded(await collectBytes()));
 
         default:
           break;
@@ -355,73 +356,20 @@ Encoding _encodingFor(ContentType contentType, Encoding defaultEncoding) {
       defaultEncoding;
 }
 
-const _ampersand = 0x26, _equals = 0x3D, _plus = 0x2B, _percent = 0x25;
-const _space = 0x20, _maxAscii = 0x7F;
-
-/// Parses an `application/x-www-form-urlencoded` body.
+/// Parses an `application/x-www-form-urlencoded` body with
+/// [Uri.splitQueryString].
 ///
-/// The body is split into names and values as raw bytes, and each one is
-/// percent-decoded and then decoded as UTF-8, as in the URL Standard. Raw
-/// bytes must be ASCII. As with
-/// [Uri.splitQueryString], a later value for a name replaces an earlier one, a
-/// name without `=` has an empty value, and an empty name is skipped.
-Map<String, String> _parseUrlEncoded(Uint8List body) {
-  var map = <String, String>{};
-  for (var start = 0; start < body.length;) {
-    var end = body.indexOf(_ampersand, start);
-    if (end == -1) end = body.length;
-    var equals = start;
-    while (equals < end && body[equals] != _equals) {
-      equals++;
-    }
-    if (equals == end) {
-      if (end > start) {
-        map[_decodeFormComponent(body, start, end)] = '';
-      }
-    } else if (equals > start) {
-      map[_decodeFormComponent(body, start, equals)] = _decodeFormComponent(
-        body,
-        equals + 1,
-        end,
-      );
-    }
-    start = end + 1;
+/// The body must be ASCII, with any other character percent-encoded as UTF-8,
+/// as in the URL Standard. The map is untyped, as in earlier releases, so
+/// callers can still add values of other types to it.
+Map<dynamic, dynamic> _parseUrlEncoded(Uint8List body) {
+  // Fails for a raw non-ASCII byte.
+  var query = ascii.decode(body);
+  if (_malformedEscape.hasMatch(query)) {
+    throw const FormatException('Invalid percent-escape in a form body.');
   }
-  return map;
+  return {...Uri.splitQueryString(query, encoding: utf8)};
 }
 
-/// Decodes the name or value in `bytes[start..end)`: `+` is a space, `%XX`
-/// is the byte `XX`, and the resulting bytes are decoded as UTF-8.
-String _decodeFormComponent(Uint8List bytes, int start, int end) {
-  var decoded = Uint8List(end - start);
-  var length = 0;
-  for (var i = start; i < end; i++) {
-    var byte = bytes[i];
-    if (byte == _plus) {
-      decoded[length++] = _space;
-    } else if (byte == _percent) {
-      var high = i + 1 < end ? _hexValue(bytes[i + 1]) : -1;
-      var low = i + 2 < end ? _hexValue(bytes[i + 2]) : -1;
-      if (high < 0 || low < 0) {
-        throw const FormatException('Invalid percent-escape in a form body.');
-      }
-      decoded[length++] = high * 16 + low;
-      i += 2;
-    } else if (byte > _maxAscii) {
-      throw const FormatException(
-        'A form body has a non-ASCII byte that is not percent-encoded.',
-      );
-    } else {
-      decoded[length++] = byte;
-    }
-  }
-  return utf8.decode(Uint8List.sublistView(decoded, 0, length));
-}
-
-/// The value of the hex digit [char], or -1 if it is not one.
-int _hexValue(int char) {
-  if (char >= 0x30 && char <= 0x39) return char - 0x30; // 0-9
-  if (char >= 0x41 && char <= 0x46) return char - 0x41 + 10; // A-F
-  if (char >= 0x61 && char <= 0x66) return char - 0x61 + 10; // a-f
-  return -1;
-}
+/// A `%` that is not followed by two hex digits.
+final _malformedEscape = RegExp('%(?![0-9A-Fa-f]{2})');

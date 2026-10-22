@@ -397,6 +397,16 @@ File content\r
   ]) {
     await check(mimeType, raw, null, 'form', error: isA<FormatException>());
   }
+  // A malformed percent-escape is rejected with 400 Bad Request.
+  for (var body in ['a=%zz', 'a=%', 'a=%4', '%zz=a']) {
+    await check(
+      'application/x-www-form-urlencoded',
+      body.codeUnits,
+      null,
+      'form',
+      error: isA<FormatException>(),
+    );
+  }
   // A percent-escape that is not UTF-8 fails, whatever the charset.
   await check(
     'application/x-www-form-urlencoded; charset=iso-8859-1',

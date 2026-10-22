@@ -85,6 +85,18 @@ void main() {
         headers: {HttpHeaders.rangeHeader: 'bytes=99999999999999999999-'},
       );
       expect(status, HttpStatus.requestedRangeNotSatisfiable);
+
+      // A range that ends before it starts is ignored, even when both
+      // positions are too large for an int.
+      (status, _, _) = await fetchResponse(
+        virDir,
+        '/file',
+        headers: {
+          HttpHeaders.rangeHeader:
+              'bytes=99999999999999999999-99999999999999999998',
+        },
+      );
+      expect(status, HttpStatus.ok);
     });
 
     testVirtualDir('an open-ended range past the end is unsatisfiable', (

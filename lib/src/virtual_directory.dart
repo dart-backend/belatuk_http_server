@@ -71,6 +71,9 @@ class VirtualDirectory {
       requests.listen(serveRequest);
 
   /// Serve a single [HttpRequest], in this [VirtualDirectory].
+  ///
+  /// The returned future completes when the response is done, or when the
+  /// client disconnected before then.
   Future serveRequest(HttpRequest request) async {
     List<String> pathSegments;
     try {
@@ -78,14 +81,14 @@ class VirtualDirectory {
     } on FormatException {
       // The path has percent-escapes that are not valid UTF-8.
       _serveErrorPage(HttpStatus.badRequest, request);
-      return request.response.done;
+      return _done(request);
     }
     var iterator = HasCurrentIterator(pathSegments.iterator);
     iterator.moveNext();
     for (var segment in _pathPrefixSegments) {
       if (!iterator.hasCurrent || iterator.current != segment) {
         _serveErrorPage(HttpStatus.notFound, request);
-        return request.response.done;
+        return _done(request);
       }
       iterator.moveNext();
     }
@@ -101,16 +104,20 @@ class VirtualDirectory {
       }
     } else if (entity is _DirectoryRedirect) {
       _unawaited(
-        request.response.redirect(
-          _trailingSlashRedirect(request.uri),
-          status: HttpStatus.movedPermanently,
-        ),
+        request.response
+            .redirect(
+              _trailingSlashRedirect(request.uri),
+              status: HttpStatus.movedPermanently,
+            )
+            .catchError((_) {
+              // The client disconnected, so there is nobody to redirect.
+            }),
       );
     } else {
       assert(entity == null);
       _serveErrorPage(HttpStatus.notFound, request);
     }
-    return request.response.done;
+    return _done(request);
   }
 
   /// Overrides the default directory listing.
@@ -225,39 +232,40 @@ class VirtualDirectory {
         if (matches != null &&
             length > 0 &&
             (matches[1]!.isNotEmpty || matches[2]!.isNotEmpty)) {
-          var first = matches[1]!;
-          var last = matches[2]!;
-          // Serve sub-range.
-          int start; // First byte position - inclusive.
-          int end; // Last byte position - inclusive.
-          bool satisfiable;
-          if (first.isEmpty) {
-            // A suffix range, for the last bytes of the file.
-            var suffixLength = _parseRangeValue(last);
-            start = max(0, length - suffixLength);
-            end = length - 1;
-            satisfiable = suffixLength > 0;
-          } else {
-            start = _parseRangeValue(first);
-            end = last.isEmpty
-                ? length - 1
-                : min(_parseRangeValue(last), length - 1);
-            satisfiable = start < length;
-          }
+          var first = matches[1]!.isEmpty
+              ? null
+              : _parseRangeValue(matches[1]!);
+          var last = matches[2]!.isEmpty ? null : _parseRangeValue(matches[2]!);
           // A range that ends before it starts is invalid, and the Range
-          // header MUST be ignored (RFC 9110 section 14.1.1).
-          var invalid =
-              first.isNotEmpty &&
-              last.isNotEmpty &&
-              _parseRangeValue(last) < start;
-          if (!invalid && !satisfiable) {
-            response
-              ..statusCode = HttpStatus.requestedRangeNotSatisfiable
-              ..headers.set(HttpHeaders.contentRangeHeader, 'bytes */$length');
-            await response.close();
-            return;
-          }
-          if (!invalid) {
+          // header MUST be ignored (RFC 9110 section 14.1.1). The positions
+          // are compared exactly, as values too large for an int are clamped.
+          if (first == null ||
+              last == null ||
+              BigInt.parse(matches[1]!) <= BigInt.parse(matches[2]!)) {
+            // Serve sub-range.
+            int start; // First byte position - inclusive.
+            int end; // Last byte position - inclusive.
+            if (first == null) {
+              // A suffix range, for the last bytes of the file.
+              start = max(0, length - last!);
+              end = length - 1;
+            } else {
+              start = first;
+              end = min(last ?? length - 1, length - 1);
+            }
+            // No byte of the file is in the range, as for a start past the
+            // end or a suffix of no bytes (RFC 9110 section 14.1.1).
+            if (start >= length) {
+              response
+                ..statusCode = HttpStatus.requestedRangeNotSatisfiable
+                ..headers.set(
+                  HttpHeaders.contentRangeHeader,
+                  'bytes */$length',
+                );
+              await response.close();
+              return;
+            }
+
             // Override Content-Length with the actual bytes sent.
             response.headers.set(
               HttpHeaders.contentLengthHeader,
@@ -303,8 +311,16 @@ class VirtualDirectory {
         }
       }
     } catch (_) {
-      response.statusCode = HttpStatus.notFound;
-      await response.close();
+      try {
+        response.statusCode = HttpStatus.notFound;
+      } on StateError {
+        // The headers were already sent, so the client disconnected.
+      }
+      try {
+        await response.close();
+      } catch (_) {
+        // The client disconnected, so there is nobody to respond to.
+      }
     }
   }
 
@@ -323,11 +339,10 @@ class VirtualDirectory {
           // TODO(kevmoo): log error
         },
         // An entry that cannot be read is left out, but a directory that
-        // cannot be listed at all fails the listing.
+        // cannot be listed at all, or any other error, fails the listing.
         test: (error) =>
-            error is! FileSystemException ||
-            error.path == null ||
-            !equals(error.path!, dir.path),
+            error is FileSystemException &&
+            (error.path == null || !equals(error.path!, dir.path)),
       ).toList();
       var entries = <(FileSystemEntity, FileStat)>[];
       // Stat the entries in batches, so a large directory neither waits on
@@ -484,7 +499,11 @@ $server
 </body>
 </html>''';
     response.write(page);
-    response.close();
+    _unawaited(
+      response.close().catchError((_) {
+        // The client disconnected, so there is nobody to respond to.
+      }),
+    );
   }
 }
 
@@ -597,6 +616,11 @@ const _statBatchSize = 64;
 /// Parses a byte position from a `Range` header, treating a number too large
 /// for an [int] as larger than any file.
 int _parseRangeValue(String value) => int.tryParse(value) ?? 0x7FFFFFFFFFFFFFFF;
+
+/// Completes when [request]'s response is done, or when the client
+/// disconnected before then, so a disconnect is not an uncaught error.
+Future<void> _done(HttpRequest request) =>
+    request.response.done.then((_) {}, onError: (_) {});
 
 // Copied from `package:pedantic` to avoid the dep.
 void _unawaited(Future<void> f) {}
