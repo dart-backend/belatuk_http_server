@@ -1,5 +1,26 @@
 # Change Log
 
+## 5.0.0
+
+### Breaking changes in 5.0.0
+
+* **Breaking:** Requires Dart 3.13 or later.
+* **Breaking:** `HttpBodyHandler` always decodes an `application/json` body as UTF-8, as RFC 8259 requires, and ignores any `charset` parameter. A leading byte order mark is ignored. A body that is not valid UTF-8 fails. This applies to `processResponse` too, so a response from a server that sends JSON in another charset, such as `application/json; charset=iso-8859-1`, now fails with a `FormatException`.
+* **Breaking:** `HttpBodyHandler` requires an `application/x-www-form-urlencoded` body to be ASCII, with any other character percent-encoded as UTF-8, as the URL Standard does. The request's charset and the default encoding are ignored for such a body. A body with raw non-ASCII bytes, or with a percent-escape that is not valid UTF-8, such as `%E9` for a Latin-1 `é`, is rejected with 400 Bad Request.
+
+### Fixes in 5.0.0
+
+* **VirtualDirectory:** A redirect that adds a directory's trailing slash always stays on the same host. A request such as `//other.host/dir` could previously redirect the client to `other.host`.
+* **VirtualDirectory:** A request whose path has percent-escapes that are not valid UTF-8, such as `/%FF`, gets a 400 Bad Request instead of an unhandled error and no response. If a custom `errorPageHandler` throws, or its future completes with an error, the response is still closed. `errorPageHandler` now accepts a `FutureOr<void> Function(HttpRequest)`, so an `async` handler can be typed as such; existing handlers are unaffected.
+* **VirtualDirectory:** A redirect to add a directory's trailing slash keeps the query string in place, instead of appending the slash to it.
+* **VirtualDirectory:** `If-Modified-Since` compares modification times to the second, as HTTP dates do, so unchanged files and listings get a 304 Not Modified.
+* **VirtualDirectory:** A directory listing's last-modified time is the newest of the directory and its entries, so editing a file in it is no longer served from cache.
+* **VirtualDirectory:** Listing a directory no longer blocks the server while each entry is checked. An entry that is removed or cannot be read is left out of the listing, and a listing that fails is a 500 Internal Server Error instead of an empty page. A client that disconnects no longer causes an uncaught error: the future returned by `serveRequest` completes normally instead of with the connection error.
+* **VirtualDirectory:** A `HEAD` request for a directory listing gets the headers without the listing.
+* **VirtualDirectory:** A `Range` value too large for an integer is handled like any other out-of-range value, instead of making an existing file a 404 Not Found.
+* **VirtualDirectory:** An open-ended `Range` that starts at or past the end of the file, such as `bytes=10-` for a 10-byte file, gets a 416 Range Not Satisfiable instead of the whole file. So does a suffix range of no bytes, `bytes=-0`. A 416 response has a `Content-Range: bytes */<length>` header. The `Range` header is ignored for an empty file, which is served with 200 OK.
+* **HttpBodyHandler:** A `multipart/form-data` body with no `boundary`, or a part with no `name`, fails with an `HttpException`, instead of a `TypeError` that escaped as an uncaught error.
+
 ## 4.6.0
 
 * Require Dart >= 3.8

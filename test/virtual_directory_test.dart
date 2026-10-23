@@ -545,9 +545,16 @@ void main() {
       await check(0);
       await check(1);
       await check(9);
-      await check(10, fileContent, null, false, HttpStatus.ok);
-      await check(11, fileContent, null, false, HttpStatus.ok);
-      await check(1000, fileContent, null, false, HttpStatus.ok);
+      // A start at or past the end of the file is unsatisfiable.
+      for (var from in [10, 11, 1000]) {
+        await check(
+          from,
+          [],
+          'bytes */10',
+          true,
+          HttpStatus.requestedRangeNotSatisfiable,
+        );
+      }
     });
 
     testVirtualDir('suffix-range', (dir) async {
@@ -586,7 +593,7 @@ void main() {
 
     testVirtualDir('unsatisfiable-range', (dir) async {
       prepare(dir);
-      Future<void> check(int from, int to) async {
+      Future<void> check(int? from, int to) async {
         var result = await fetchContentAndResponse(
           virDir,
           '/file',
@@ -596,13 +603,17 @@ void main() {
         var content = result[0];
         var response = result[1];
         expect(content.length, 0);
-        expect(response.headers[HttpHeaders.contentRangeHeader], isNull);
+        expect(response.headers[HttpHeaders.contentRangeHeader], [
+          'bytes */10',
+        ]);
         expect(response.statusCode, HttpStatus.requestedRangeNotSatisfiable);
       }
 
       await check(10, 11);
       await check(10, 1000);
       await check(1000, 1000);
+      // A suffix range of no bytes (RFC 9110 section 14.1.1).
+      await check(null, 0);
     });
 
     testVirtualDir('invalid-range', (dir) async {
@@ -624,7 +635,6 @@ void main() {
       await check(1, 0);
       await check(10, 0);
       await check(1000, 999);
-      await check(null, 0); // This is effectively range 10-9.
     });
   });
 
@@ -650,30 +660,28 @@ void main() {
     });
   });
 
-  group(
-    'escape-root',
-    () {
-      testVirtualDir('escape1', (dir) async {
-        var virDir = VirtualDirectory(dir.path);
-        virDir.allowDirectoryListing = true;
+  // Dart removes `..` segments when it parses a request URI, so a request
+  // for a path above the root is served the root instead.
+  group('escape-root', () {
+    testVirtualDir('escape1', (dir) async {
+      File('${dir.path}/in-root').createSync();
+      var virDir = VirtualDirectory(dir.path);
+      virDir.allowDirectoryListing = true;
 
-        var result = await statusCodeForVirtDir(virDir, '/../');
-        expect(result, HttpStatus.notFound);
-      });
+      var result = await fetchAsString(virDir, '/../');
+      expect(result, contains('in-root'));
+    });
 
-      testVirtualDir('escape2', (dir) async {
-        Directory('${dir.path}/dir').createSync();
-        var virDir = VirtualDirectory(dir.path);
-        virDir.allowDirectoryListing = true;
+    testVirtualDir('escape2', (dir) async {
+      Directory('${dir.path}/dir').createSync();
+      File('${dir.path}/in-root').createSync();
+      var virDir = VirtualDirectory(dir.path);
+      virDir.allowDirectoryListing = true;
 
-        var result = await statusCodeForVirtDir(virDir, '/dir/../../');
-        expect(result, HttpStatus.notFound);
-      });
-    },
-    skip:
-        'Broken. Likely due to dart:core Uri changes.'
-        'See https://github.com/dart-lang/http_server/issues/40',
-  );
+      var result = await fetchAsString(virDir, '/dir/../../');
+      expect(result, contains('in-root'));
+    });
+  });
 
   group('url-decode', () {
     testVirtualDir('with-space', (dir) async {
@@ -715,15 +723,8 @@ void main() {
       expect(result, HttpStatus.notFound);
     });
 
-    group(
-      'broken',
-      () {
-        _testEncoding('..', HttpStatus.notFound, false);
-      },
-      skip:
-          'Broken. Likely due to dart:core Uri changes.'
-          'See https://github.com/dart-lang/http_server/issues/40',
-    );
+    // `/..` is normalized to `/`, so the root listing is served.
+    _testEncoding('..', HttpStatus.ok, false);
 
     _testEncoding('%2e%2e', HttpStatus.ok);
     _testEncoding('%252e%252e', HttpStatus.ok);

@@ -131,6 +131,95 @@ Future<int> fetchStatusCode(
   }
 }
 
+/// Sends a [method] request for [path], which may include a query, to
+/// [virDir] with extra request [headers], without following redirects, and
+/// returns the response's status code, headers and body.
+///
+/// A real server drops the body of a `HEAD` response itself, so only the
+/// fakes show whether one was written.
+///
+/// If [rawTarget] is true, [path] is sent as the request target exactly as
+/// written, without the normalization [HttpClient] applies (such as removing
+/// `.` segments). Only the status line and headers of the reply are parsed.
+///
+/// Like [statusCodeForVirtDir], this uses a real server or the fakes,
+/// depending on the current test's mode.
+Future<(int, HttpHeaders, List<int>)> fetchResponse(
+  VirtualDirectory virDir,
+  String path, {
+  String method = 'GET',
+  Map<String, String> headers = const {},
+  DateTime? ifModifiedSince,
+  bool rawTarget = false,
+}) async {
+  if (_isFakeTestExpando[currentTestCase]!) {
+    var request = FakeHttpRequest(
+      Uri.parse(path),
+      method: method,
+      followRedirects: false,
+      ifModifiedSince: ifModifiedSince,
+      data: StreamController<Uint8List>().stream,
+    );
+    headers.forEach(request.headers.set);
+    var response = await _withFakeRequest(virDir, request);
+    return (response.statusCode, response.headers, response.fakeContentBinary);
+  }
+
+  if (rawTarget) {
+    return _withServer(virDir, (port) async {
+      var socket = await Socket.connect(InternetAddress.loopbackIPv4, port);
+      socket.write(
+        '$method $path HTTP/1.1\r\n'
+        'Host: 127.0.0.1:$port\r\n'
+        'Connection: close\r\n'
+        '${headers.entries.map((h) => '${h.key}: ${h.value}\r\n').join()}'
+        '\r\n',
+      );
+      var reply = latin1.decode(
+        await socket.fold<List<int>>(<int>[], (b, data) => b..addAll(data)),
+      );
+      var end = reply.indexOf('\r\n\r\n');
+      var lines = reply.substring(0, end).split('\r\n');
+      var responseHeaders = FakeHttpHeaders();
+      for (var line in lines.skip(1)) {
+        var colon = line.indexOf(':');
+        responseHeaders.set(
+          line.substring(0, colon),
+          line.substring(colon + 1).trim(),
+        );
+      }
+      return (
+        int.parse(lines.first.split(' ')[1]),
+        responseHeaders as HttpHeaders,
+        latin1.encode(reply.substring(end + 4)),
+      );
+    });
+  }
+
+  return _withServer(virDir, (port) async {
+    var client = HttpClient();
+    try {
+      var request = await client.openUrl(
+        method,
+        Uri.parse('http://127.0.0.1:$port$path'),
+      );
+      request.followRedirects = false;
+      if (ifModifiedSince != null) {
+        request.headers.ifModifiedSince = ifModifiedSince;
+      }
+      headers.forEach(request.headers.set);
+      var response = await request.close();
+      var body = await response.fold<List<int>>(
+        <int>[],
+        (body, data) => body..addAll(data),
+      );
+      return (response.statusCode, response.headers, body);
+    } finally {
+      client.close();
+    }
+  });
+}
+
 Future<HttpHeaders> fetchHEaders(
   VirtualDirectory virDir,
   String path, {
@@ -262,7 +351,7 @@ Future<T> _withServer<T>(
   VirtualDirectory virDir,
   Future<T> Function(int port) func,
 ) async {
-  var server = await HttpServer.bind('localhost', 0);
+  var server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
 
   try {
     virDir.serve(server);
@@ -275,7 +364,7 @@ Future<T> _withServer<T>(
 Future<HttpHeaders> _headers(int port, String path, int? from, int? to) async {
   var client = HttpClient();
   try {
-    var request = await client.get('localhost', port, path);
+    var request = await client.get('127.0.0.1', port, path);
     _addRangeHeader(request, from, to);
     var response = await request.close();
     await response.drain();
@@ -288,7 +377,7 @@ Future<HttpHeaders> _headers(int port, String path, int? from, int? to) async {
 Future<String> _fetchAsString(int port, String path) async {
   var client = HttpClient();
   try {
-    var request = await client.get('localhost', port, path);
+    var request = await client.get('127.0.0.1', port, path);
     var response = await request.close();
     return await utf8.decodeStream(response.cast<List<int>>());
   } finally {
@@ -304,7 +393,7 @@ Future<List<int>> _fetchAsBytes(
 ) async {
   var client = HttpClient();
   try {
-    var request = await client.get('localhost', port, path);
+    var request = await client.get('127.0.0.1', port, path);
     _addRangeHeader(request, from, to);
     var response = await request.close();
     return await response.fold([], (p, e) => p..addAll(e));
@@ -321,7 +410,7 @@ Future<List> _fetchContentAndResponse(
 ) async {
   var client = HttpClient();
   try {
-    var request = await client.get('localhost', port, path);
+    var request = await client.get('127.0.0.1', port, path);
     _addRangeHeader(request, from, to);
     var response = await request.close();
     var bytes = await response.fold<List<int>>([], (p, e) => p..addAll(e));
@@ -340,14 +429,14 @@ Uri _localhostUri(
   if (rawPath) {
     return Uri(
       scheme: secure ? 'https' : 'http',
-      host: 'localhost',
+      host: '127.0.0.1',
       port: port,
       path: path,
     );
   } else {
     return (secure
-        ? Uri.https('localhost:$port', path)
-        : Uri.http('localhost:$port', path));
+        ? Uri.https('127.0.0.1:$port', path)
+        : Uri.http('127.0.0.1:$port', path));
   }
 }
 

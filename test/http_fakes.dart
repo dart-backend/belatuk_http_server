@@ -131,11 +131,12 @@ class FakeHttpRequest extends StreamView<Uint8List> implements HttpRequest {
   @override
   final HttpHeaders headers = FakeHttpHeaders();
   @override
-  final String method = 'GET';
+  final String method;
   final bool followRedirects;
 
   FakeHttpRequest(
     this.uri, {
+    this.method = 'GET',
     this.followRedirects = true,
     DateTime? ifModifiedSince,
     required Stream<Uint8List> data,

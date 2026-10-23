@@ -64,7 +64,7 @@ Future _postDataTest(
   List<FormField> expectedFields, {
   Encoding defaultEncoding = latin1,
 }) async {
-  var addr = (await InternetAddress.lookup('localhost'))[0];
+  var addr = InternetAddress.loopbackIPv4;
 
   var server = await HttpServer.bind(addr, 0);
 
@@ -107,7 +107,7 @@ Future _postDataTest(
 
   var client = HttpClient();
 
-  var request = await client.post('localhost', server.port, '/');
+  var request = await client.post('127.0.0.1', server.port, '/');
 
   request.headers.set(
     'content-type',

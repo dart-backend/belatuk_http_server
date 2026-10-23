@@ -18,7 +18,7 @@ void main() {
     late VirtualHost virHost;
 
     setUp(() async {
-      server = await HttpServer.bind('localhost', 0);
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       virHost = VirtualHost(server);
     });
 
@@ -135,7 +135,7 @@ void main() {
 
     test('multiple-source-https', () async {
       var secondServer = await HttpServer.bindSecure(
-        'localhost',
+        InternetAddress.loopbackIPv4,
         0,
         serverContext,
       );

@@ -32,17 +32,20 @@ import 'http_multipart_form_data.dart';
 ///
 /// For content type `application/json` the body is decoded into a
 /// string which is then parsed as JSON. The resulting body is a
-/// [Map].  The 'charset' parameter of the content type specifies the
-/// encoding used for decoding. If no 'charset' is present the default
-/// encoding of UTF-8 is used.
+/// [Map]. The body is always decoded as UTF-8, as RFC 8259 requires, and
+/// the 'charset' parameter of the content type is ignored. A leading byte
+/// order mark is ignored.
 ///
 /// For content type `application/x-www-form-urlencoded` the body is a
 /// query string which is then split according to the rules for
 /// splitting a query string. The resulting body is a `Map<String,
 /// String>`.  If the same name is present several times in the query
 /// string, then the last value seen for this name will be in the
-/// resulting map. The encoding US-ASCII is always used for decoding
-/// the body.
+/// resulting map. The body must be ASCII, with any other character
+/// percent-encoded as UTF-8, as in the URL Standard, so the 'charset'
+/// parameter of the content type is ignored. A body with raw non-ASCII bytes,
+/// or with percent-escapes that are not UTF-8, is rejected, and
+/// [processRequest] responds with 400 Bad Request.
 ///
 /// For content type `multipart/form-data` the body is parsed into
 /// it's different fields. The resulting body is a `Map<String,
@@ -105,8 +108,7 @@ class HttpBodyHandler
   /// [defaultEncoding] accordingly. This is required for parsing
   /// `multipart/form-data` content correctly. See the class comment
   /// for more information on `multipart/form-data`.
-  HttpBodyHandler({Encoding defaultEncoding = utf8})
-    : _defaultEncoding = defaultEncoding;
+  HttpBodyHandler({this._defaultEncoding = utf8});
 
   /// Process and parse an incoming [HttpRequest].
   ///
@@ -124,7 +126,11 @@ class HttpBodyHandler
     } catch (e) {
       // Try to send BAD_REQUEST response.
       request.response.statusCode = HttpStatus.badRequest;
-      await request.response.close();
+      try {
+        await request.response.close();
+      } catch (_) {
+        // The client disconnected; the error to report is the original one.
+      }
       rethrow;
     }
   }
@@ -231,13 +237,16 @@ Future<HttpBody> _process(
   HttpHeaders headers,
   Encoding defaultEncoding,
 ) async {
-  Future<HttpBody> asBinary() async {
+  Future<Uint8List> collectBytes() async {
     var builder = await stream.fold<BytesBuilder>(
       BytesBuilder(),
       (builder, data) => builder..add(data),
     );
-    return HttpBody._('binary', builder.takeBytes());
+    return builder.takeBytes();
   }
+
+  Future<HttpBody> asBinary() async =>
+      HttpBody._('binary', await collectBytes());
 
   if (headers.contentType == null) {
     return asBinary();
@@ -245,11 +254,7 @@ Future<HttpBody> _process(
 
   var contentType = headers.contentType!;
 
-  Future<HttpBody> asText(Encoding defaultEncoding) async {
-    Encoding? encoding;
-    var charset = contentType.charset;
-    if (charset != null) encoding = Encoding.getByName(charset);
-    encoding ??= defaultEncoding;
+  Future<HttpBody> asText(Encoding encoding) async {
     var buffer = await encoding.decoder
         .bind(stream)
         .fold(StringBuffer(), (dynamic buffer, data) => buffer..write(data));
@@ -257,71 +262,69 @@ Future<HttpBody> _process(
   }
 
   Future<HttpBody> asFormData() async {
-    var values =
-        await MimeMultipartTransformer(contentType.parameters['boundary']!)
-            .bind(stream)
-            .map(
-              (part) => HttpMultipartFormData.parse(
-                part,
-                defaultEncoding: defaultEncoding,
-              ),
-            )
-            .map((multipart) async {
-              dynamic data;
-              if (multipart.isText) {
-                var buffer = await multipart.fold<StringBuffer>(
-                  StringBuffer(),
-                  (b, s) => b..write(s),
-                );
-                data = buffer.toString();
-              } else {
-                var buffer = await multipart.fold<BytesBuilder>(
-                  BytesBuilder(),
-                  (b, d) => b..add(d as List<int>),
-                );
-                data = buffer.takeBytes();
-              }
-              var filename =
-                  multipart.contentDisposition.parameters['filename'];
-              if (filename != null) {
-                data = HttpBodyFileUpload._(
-                  multipart.contentType,
-                  filename,
-                  data,
-                );
-              }
-              return [multipart.contentDisposition.parameters['name'], data];
-            })
-            .toList();
-    var parts = await Future.wait(values);
+    var boundary = contentType.parameters['boundary'];
+    if (boundary == null) {
+      throw HttpException('The multipart/form-data body has no boundary.');
+    }
+    // Parts are handled one at a time, in order, so that an invalid part fails
+    // the whole body instead of escaping as an uncaught error.
+    var parts = await MimeMultipartTransformer(boundary)
+        .bind(stream)
+        .map(
+          (part) => HttpMultipartFormData.parse(
+            part,
+            defaultEncoding: defaultEncoding,
+          ),
+        )
+        .asyncMap((multipart) async {
+          var name = multipart.contentDisposition.parameters['name'];
+          if (name == null) {
+            throw HttpException('A multipart/form-data part has no name.');
+          }
+          dynamic data;
+          if (multipart.isText) {
+            var buffer = await multipart.fold<StringBuffer>(
+              StringBuffer(),
+              (b, s) => b..write(s),
+            );
+            data = buffer.toString();
+          } else {
+            var buffer = await multipart.fold<BytesBuilder>(
+              BytesBuilder(),
+              (b, d) => b..add(d as List<int>),
+            );
+            data = buffer.takeBytes();
+          }
+          var filename = multipart.contentDisposition.parameters['filename'];
+          if (filename != null) {
+            data = HttpBodyFileUpload._(multipart.contentType, filename, data);
+          }
+          return (name, data);
+        })
+        .toList();
     var map = <String, dynamic>{};
-    for (var part in parts) {
-      map[part[0] as String] = part[1]; // Override existing entries.
+    for (var (name, data) in parts) {
+      map[name] = data; // Override existing entries.
     }
     return HttpBody._('form', map);
   }
 
   switch (contentType.primaryType) {
     case 'text':
-      return asText(defaultEncoding);
+      return asText(_encodingFor(contentType, defaultEncoding));
 
     case 'application':
       switch (contentType.subType) {
         case 'json':
-          var body = await asText(utf8);
-          return HttpBody._('json', jsonDecode(body.body as String));
+          // JSON is always UTF-8 and has no charset parameter (RFC 8259,
+          // section 8.1), so any charset given is ignored. A leading byte
+          // order mark is allowed to be ignored, and is.
+          var text = (await asText(utf8)).body as String;
+          if (text.startsWith('\uFEFF')) text = text.substring(1);
+          return HttpBody._('json', jsonDecode(text));
 
         case 'x-www-form-urlencoded':
-          var body = await asText(ascii);
-          var map = Uri.splitQueryString(
-            body.body as String,
-            encoding: defaultEncoding,
-          );
-          var result = {};
-          for (var key in map.keys) {
-            result[key] = map[key];
-          }
-          return HttpBody._('form', result);
+          return HttpBody._('form', _parseUrlEncoded(await collectBytes()));
 
         default:
           break;
@@ -344,3 +347,29 @@ Future<HttpBody> _process(
 
   return asBinary();
 }
+
+/// The encoding named by [contentType]'s charset, or [defaultEncoding] if it
+/// names none that is known.
+Encoding _encodingFor(ContentType contentType, Encoding defaultEncoding) {
+  var charset = contentType.charset;
+  return (charset == null ? null : Encoding.getByName(charset)) ??
+      defaultEncoding;
+}
+
+/// Parses an `application/x-www-form-urlencoded` body with
+/// [Uri.splitQueryString].
+///
+/// The body must be ASCII, with any other character percent-encoded as UTF-8,
+/// as in the URL Standard. The map is untyped, as in earlier releases, so
+/// callers can still add values of other types to it.
+Map<dynamic, dynamic> _parseUrlEncoded(Uint8List body) {
+  // Fails for a raw non-ASCII byte.
+  var query = ascii.decode(body);
+  if (_malformedEscape.hasMatch(query)) {
+    throw const FormatException('Invalid percent-escape in a form body.');
+  }
+  return {...Uri.splitQueryString(query, encoding: utf8)};
+}
+
+/// A `%` that is not followed by two hex digits.
+final _malformedEscape = RegExp('%(?![0-9A-Fa-f]{2})');

@@ -12,15 +12,15 @@ import 'package:test/test.dart';
 
 import 'http_fakes.dart';
 
-void _testHttpClientResponseBody() {
-  void check(
+Future<void> _testHttpClientResponseBody() async {
+  Future<void> check(
     String mimeType,
     List<int> content,
     dynamic expectedBody,
     String type, [
     bool shouldFail = false,
   ]) async {
-    var server = await HttpServer.bind('localhost', 0);
+    var server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     server.listen((request) {
       request.listen(
         (_) {},
@@ -34,7 +34,7 @@ void _testHttpClientResponseBody() {
 
     var client = HttpClient();
     try {
-      var request = await client.get('localhost', server.port, '/');
+      var request = await client.get('127.0.0.1', server.port, '/');
       var response = await request.close();
       var body = await HttpBodyHandler.processResponse(response);
       expect(shouldFail, isFalse);
@@ -49,6 +49,8 @@ void _testHttpClientResponseBody() {
         default:
           fail('bad body type');
       }
+    } on TestFailure {
+      rethrow;
     } catch (_) {
       if (!shouldFail) rethrow;
     } finally {
@@ -57,34 +59,46 @@ void _testHttpClientResponseBody() {
     }
   }
 
-  check('text/plain', 'body'.codeUnits, 'body', 'text');
-  check('text/plain; charset=utf-8', 'body'.codeUnits, 'body', 'text');
-  check('text/plain; charset=iso-8859-1', 'body'.codeUnits, 'body', 'text');
-  check('text/plain; charset=us-ascii', 'body'.codeUnits, 'body', 'text');
-  check('text/plain; charset=utf-8', [42], '*', 'text');
-  check('text/plain; charset=us-ascii', [142], null, 'text', true);
-  check('text/plain; charset=utf-8', [142], null, 'text', true);
+  await check('text/plain', 'body'.codeUnits, 'body', 'text');
+  await check('text/plain; charset=utf-8', 'body'.codeUnits, 'body', 'text');
+  await check(
+    'text/plain; charset=iso-8859-1',
+    'body'.codeUnits,
+    'body',
+    'text',
+  );
+  await check('text/plain; charset=us-ascii', 'body'.codeUnits, 'body', 'text');
+  await check('text/plain; charset=utf-8', [42], '*', 'text');
+  await check('text/plain; charset=us-ascii', [142], null, 'text', true);
+  await check('text/plain; charset=utf-8', [142], null, 'text', true);
 
-  check('application/json', '{"val": 5}'.codeUnits, {'val': 5}, 'json');
-  check('application/json', '{ bad json }'.codeUnits, null, 'json', true);
+  await check('application/json', '{"val": 5}'.codeUnits, {'val': 5}, 'json');
+  await check('application/json', '{ bad json }'.codeUnits, null, 'json', true);
 }
 
-void _testHttpServerRequestBody() {
-  void check(
+Future<void> _testHttpServerRequestBody() async {
+  Future<void> check(
     String? mimeType,
     List<int> content,
     dynamic expectedBody,
     String type, {
     bool shouldFail = false,
+    Matcher? error,
     Encoding defaultEncoding = utf8,
   }) async {
-    var server = await HttpServer.bind('localhost', 0);
+    if (error != null) shouldFail = true;
+    var server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    // What the handler produced: the parsed body, or the error it failed with.
+    var outcome = Completer<Object>();
     server
         .transform(HttpBodyHandler(defaultEncoding: defaultEncoding))
         .listen(
           (body) {
-            if (shouldFail) return;
-            expect(shouldFail, isFalse);
+            outcome.complete(body);
+            if (shouldFail) {
+              body.request.response.close();
+              return;
+            }
             expect(body.type, equals(type));
             switch (type) {
               case 'text':
@@ -142,50 +156,98 @@ void _testHttpServerRequestBody() {
             }
             body.request.response.close();
           },
-          onError: (Object error) {
-            // ignore: only_throw_errors
-            if (!shouldFail) throw error;
+          onError: (Object e) {
+            if (!outcome.isCompleted) outcome.complete(e);
           },
         );
 
     var client = HttpClient();
     try {
-      var request = await client.post('localhost', server.port, '/');
+      var request = await client.post('127.0.0.1', server.port, '/');
       if (mimeType != null) {
         request.headers.contentType = ContentType.parse(mimeType);
       }
       request.add(content);
       var response = await request.close();
+      await response.drain<void>();
+      var result = await outcome.future;
       if (shouldFail) {
+        expect(
+          result,
+          isNot(isA<HttpRequestBody>()),
+          reason: 'The body should have been rejected.',
+        );
+        if (error != null) expect(result, error);
         expect(response.statusCode, equals(HttpStatus.badRequest));
+      } else {
+        // ignore: only_throw_errors
+        if (result is! HttpRequestBody) throw result;
+        expect(response.statusCode, equals(HttpStatus.ok));
       }
-      return response.drain();
-    } catch (_) {
-      if (!shouldFail) rethrow;
     } finally {
       client.close();
       await server.close();
     }
   }
 
-  check('text/plain', 'body'.codeUnits, 'body', 'text');
-  check('text/plain; charset=utf-8', 'body'.codeUnits, 'body', 'text');
-  check('text/plain; charset=utf-8', [42], '*', 'text');
-  check('text/plain; charset=us-ascii', [142], null, 'text', shouldFail: true);
-  check('text/plain; charset=utf-8', [142], null, 'text', shouldFail: true);
+  await check('text/plain', 'body'.codeUnits, 'body', 'text');
+  await check('text/plain; charset=utf-8', 'body'.codeUnits, 'body', 'text');
+  await check('text/plain; charset=utf-8', [42], '*', 'text');
+  await check(
+    'text/plain; charset=us-ascii',
+    [142],
+    null,
+    'text',
+    shouldFail: true,
+  );
+  await check(
+    'text/plain; charset=utf-8',
+    [142],
+    null,
+    'text',
+    shouldFail: true,
+  );
 
-  check('application/json', '{"val": 5}'.codeUnits, {'val': 5}, 'json');
-  check(
+  await check('application/json', '{"val": 5}'.codeUnits, {'val': 5}, 'json');
+  await check(
     'application/json',
     '{ bad json }'.codeUnits,
     null,
     'json',
     shouldFail: true,
   );
+  // JSON is always UTF-8, whatever charset the request declares.
+  await check(
+    'application/json; charset=iso-8859-1',
+    utf8.encode('{"val": "é"}'),
+    {'val': 'é'},
+    'json',
+  );
+  await check(
+    'application/json; charset=us-ascii',
+    utf8.encode('{"val": "é"}'),
+    {'val': 'é'},
+    'json',
+    defaultEncoding: latin1,
+  );
+  // A leading byte order mark is ignored.
+  await check(
+    'application/json',
+    [0xEF, 0xBB, 0xBF, ...'{"val": 5}'.codeUnits],
+    {'val': 5},
+    'json',
+  );
+  await check(
+    'application/json',
+    [...'{"val": "'.codeUnits, 0xE9, ...'"}'.codeUnits],
+    null,
+    'json',
+    shouldFail: true,
+  );
 
-  check(null, 'body'.codeUnits, 'body'.codeUnits, 'binary');
+  await check(null, 'body'.codeUnits, 'body'.codeUnits, 'binary');
 
-  check(
+  await check(
     'multipart/form-data; boundary=AaB03x',
     '''
 --AaB03x\r
@@ -198,7 +260,7 @@ Larry\r
     'form',
   );
 
-  check(
+  await check(
     'multipart/form-data; boundary=AaB03x',
     '''
 --AaB03x\r
@@ -218,7 +280,7 @@ File content\r
     'form',
   );
 
-  check(
+  await check(
     'multipart/form-data; boundary=AaB03x',
     '''
 --AaB03x\r
@@ -243,7 +305,7 @@ File content\r
     'form',
   );
 
-  check(
+  await check(
     'multipart/form-data; boundary=AaB03x',
     '''
 --AaB03x\r
@@ -263,7 +325,7 @@ File content\r
     'form',
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     '%E5%B9%B3%3D%E4%BB%AE%E5%90%8D=%E5%B9%B3%E4%BB%AE%E5%90%8D&b'
             '=%E5%B9%B3%E4%BB%AE%E5%90%8D'
@@ -272,7 +334,7 @@ File content\r
     'form',
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'a=%F8+%26%23548%3B'.codeUnits,
     null,
@@ -280,7 +342,7 @@ File content\r
     shouldFail: true,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'a=%C0%A0'.codeUnits,
     null,
@@ -288,7 +350,7 @@ File content\r
     shouldFail: true,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'a=x%A0x'.codeUnits,
     null,
@@ -296,7 +358,7 @@ File content\r
     shouldFail: true,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'a=x%C0x'.codeUnits,
     null,
@@ -304,19 +366,102 @@ File content\r
     shouldFail: true,
   );
 
-  check('application/x-www-form-urlencoded', 'a=%C3%B8+%C8%A4'.codeUnits, {
-    'a': 'ø Ȥ',
-  }, 'form');
-
-  check(
+  await check(
     'application/x-www-form-urlencoded',
-    'a=%F8+%26%23548%3B'.codeUnits,
+    'a=%C3%B8+%C8%A4'.codeUnits,
+    {'a': 'ø Ȥ'},
+    'form',
+  );
+  // Percent-escapes are UTF-8, whatever the charset.
+  await check(
+    'application/x-www-form-urlencoded; charset=iso-8859-1',
+    'name=%C3%A9'.codeUnits,
+    {'name': 'é'},
+    'form',
+    defaultEncoding: latin1,
+  );
+  // Raw non-ASCII bytes are rejected with 400 Bad Request, whatever the
+  // charset.
+  for (var (mimeType, raw) in [
+    ('application/x-www-form-urlencoded', utf8.encode('name=José')),
+    ('application/x-www-form-urlencoded; charset=utf-8', utf8.encode('€=1')),
+    (
+      'application/x-www-form-urlencoded; charset=iso-8859-1',
+      [...'name='.codeUnits, 0xE9],
+    ),
+    // Part of a character percent-encoded and part not.
+    (
+      'application/x-www-form-urlencoded; charset=utf-8',
+      [...'name='.codeUnits, 0xC3, ...'%A9'.codeUnits],
+    ),
+  ]) {
+    await check(mimeType, raw, null, 'form', error: isA<FormatException>());
+  }
+  // A malformed percent-escape is rejected with 400 Bad Request.
+  for (var body in ['a=%zz', 'a=%', 'a=%4', '%zz=a']) {
+    await check(
+      'application/x-www-form-urlencoded',
+      body.codeUnits,
+      null,
+      'form',
+      error: isA<FormatException>(),
+    );
+  }
+  // A percent-escape that is not UTF-8 fails, whatever the charset.
+  await check(
+    'application/x-www-form-urlencoded; charset=iso-8859-1',
+    'name=%E9'.codeUnits,
+    null,
+    'form',
+    shouldFail: true,
+  );
+  await check(
+    'application/x-www-form-urlencoded',
+    'name=%E9'.codeUnits,
+    null,
+    'form',
+    shouldFail: true,
+    defaultEncoding: latin1,
+  );
+
+  await check(
+    'multipart/form-data',
+    [],
+    null,
+    'form',
+    error: isA<HttpException>(),
+  );
+
+  await check(
+    'multipart/form-data; boundary=AaB03x',
+    utf8.encode(
+      '--AaB03x\r\n'
+      'Content-Disposition: form-data; filename="a.txt"\r\n'
+      '\r\n'
+      'content\r\n'
+      '--AaB03x--\r\n',
+    ),
+    null,
+    'form',
+    error: isA<HttpException>(),
+  );
+
+  await check(
+    'application/x-www-form-urlencoded',
+    'name=Jos%C3%A9&a=b+c'.codeUnits,
+    {'name': 'José', 'a': 'b c'},
+    'form',
+  );
+
+  await check(
+    'application/x-www-form-urlencoded',
+    'a=%C3%B8+%26%23548%3B'.codeUnits,
     {'a': 'ø &#548;'},
     'form',
     defaultEncoding: latin1,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'name=%26'.codeUnits,
     {'name': '&'},
@@ -324,15 +469,15 @@ File content\r
     defaultEncoding: latin1,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
-    'name=%F8%26'.codeUnits,
+    'name=%C3%B8%26'.codeUnits,
     {'name': 'ø&'},
     'form',
     defaultEncoding: latin1,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'name=%26%3B'.codeUnits,
     {'name': '&;'},
@@ -340,7 +485,7 @@ File content\r
     defaultEncoding: latin1,
   );
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'name=%26%23548%3B%26%23548%3B'.codeUnits,
     {'name': '&#548;&#548;'},
@@ -348,28 +493,31 @@ File content\r
     defaultEncoding: latin1,
   );
 
-  check('application/x-www-form-urlencoded', 'name=%26'.codeUnits, {
+  await check('application/x-www-form-urlencoded', 'name=%26'.codeUnits, {
     'name': '&',
   }, 'form');
 
-  check('application/x-www-form-urlencoded', 'name=%C3%B8%26'.codeUnits, {
+  await check('application/x-www-form-urlencoded', 'name=%C3%B8%26'.codeUnits, {
     'name': 'ø&',
   }, 'form');
 
-  check('application/x-www-form-urlencoded', 'name=%26%3B'.codeUnits, {
+  await check('application/x-www-form-urlencoded', 'name=%26%3B'.codeUnits, {
     'name': '&;',
   }, 'form');
 
-  check(
+  await check(
     'application/x-www-form-urlencoded',
     'name=%C8%A4%26%23548%3B'.codeUnits,
     {'name': 'Ȥ&#548;'},
     'form',
   );
 
-  check('application/x-www-form-urlencoded', 'name=%C8%A4%C8%A4'.codeUnits, {
-    'name': 'ȤȤ',
-  }, 'form');
+  await check(
+    'application/x-www-form-urlencoded',
+    'name=%C8%A4%C8%A4'.codeUnits,
+    {'name': 'ȤȤ'},
+    'form',
+  );
 }
 
 void main() {

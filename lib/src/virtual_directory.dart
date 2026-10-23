@@ -5,6 +5,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' show max, min;
 
 import 'package:belatuk_http_server/src/has_current_iterator.dart';
 import 'package:mime/mime.dart';
@@ -41,14 +42,14 @@ class VirtualDirectory {
 
   final RegExp _invalidPathRegExp = RegExp('[\\/\x00]');
 
-  void Function(HttpRequest)? _errorCallback;
+  FutureOr<void> Function(HttpRequest)? _errorCallback;
   void Function(Directory, HttpRequest)? _dirCallback;
 
   static List<String> _parsePathPrefix(String? pathPrefix) {
     if (pathPrefix == null) return <String>[];
-    return Uri(
-      path: pathPrefix,
-    ).pathSegments.where((segment) => segment.isNotEmpty).toList();
+    return Uri(path: pathPrefix).pathSegments
+        .where((segment) => segment.isNotEmpty)
+        .toList();
   }
 
   /// Create a new [VirtualDirectory] for serving static file content of the
@@ -70,13 +71,24 @@ class VirtualDirectory {
       requests.listen(serveRequest);
 
   /// Serve a single [HttpRequest], in this [VirtualDirectory].
+  ///
+  /// The returned future completes when the response is done, or when the
+  /// client disconnected before then.
   Future serveRequest(HttpRequest request) async {
-    var iterator = HasCurrentIterator(request.uri.pathSegments.iterator);
+    List<String> pathSegments;
+    try {
+      pathSegments = request.uri.pathSegments;
+    } on FormatException {
+      // The path has percent-escapes that are not valid UTF-8.
+      _serveErrorPage(HttpStatus.badRequest, request);
+      return _done(request);
+    }
+    var iterator = HasCurrentIterator(pathSegments.iterator);
     iterator.moveNext();
     for (var segment in _pathPrefixSegments) {
       if (!iterator.hasCurrent || iterator.current != segment) {
         _serveErrorPage(HttpStatus.notFound, request);
-        return request.response.done;
+        return _done(request);
       }
       iterator.moveNext();
     }
@@ -92,16 +104,20 @@ class VirtualDirectory {
       }
     } else if (entity is _DirectoryRedirect) {
       _unawaited(
-        request.response.redirect(
-          Uri.parse('${request.uri}/'),
-          status: HttpStatus.movedPermanently,
-        ),
+        request.response
+            .redirect(
+              _trailingSlashRedirect(request.uri),
+              status: HttpStatus.movedPermanently,
+            )
+            .catchError((_) {
+              // The client disconnected, so there is nobody to redirect.
+            }),
       );
     } else {
       assert(entity == null);
       _serveErrorPage(HttpStatus.notFound, request);
     }
-    return request.response.done;
+    return _done(request);
   }
 
   /// Overrides the default directory listing.
@@ -115,8 +131,10 @@ class VirtualDirectory {
   /// Overrides the default error handle.
   ///
   /// When [callback] is invoked, the `statusCode` property of the response is
-  /// set.
-  set errorPageHandler(void Function(HttpRequest) callback) {
+  /// set. The [callback] must close the response. If it throws, or returns a
+  /// future that completes with an error, the response is closed and the
+  /// error is ignored.
+  set errorPageHandler(FutureOr<void> Function(HttpRequest) callback) {
     _errorCallback = callback;
   }
 
@@ -194,8 +212,7 @@ class VirtualDirectory {
     // TODO(ajohnsen): Set up Zone support for these errors.
     try {
       var lastModified = await file.lastModified();
-      if (request.headers.ifModifiedSince != null &&
-          !lastModified.isAfter(request.headers.ifModifiedSince!)) {
+      if (_isNotModified(request, lastModified)) {
         response.statusCode = HttpStatus.notModified;
         await response.close();
         return null;
@@ -209,29 +226,42 @@ class VirtualDirectory {
       if (range != null) {
         // We only support one range, where the standard support several.
         var matches = RegExp(r'^bytes=(\d*)\-(\d*)$').firstMatch(range);
-        // If the range header have the right format, handle it.
+        // If the range header have the right format, handle it. An empty
+        // file has no satisfiable ranges, so the Range header is ignored for
+        // it instead (RFC 9110 section 14.2).
         if (matches != null &&
+            length > 0 &&
             (matches[1]!.isNotEmpty || matches[2]!.isNotEmpty)) {
-          // Serve sub-range.
-          int start; // First byte position - inclusive.
-          int end; // Last byte position - inclusive.
-          if (matches[1]!.isEmpty) {
-            start = length - int.parse(matches[2]!);
-            if (start < 0) start = 0;
-            end = length - 1;
-          } else {
-            start = int.parse(matches[1]!);
-            end = matches[2]!.isEmpty ? length - 1 : int.parse(matches[2]!);
-          }
-          // If the range is syntactically invalid the Range header
-          // MUST be ignored (RFC 2616 section 14.35.1).
-          if (start <= end) {
-            if (end >= length) {
+          var first = matches[1]!.isEmpty
+              ? null
+              : _parseRangeValue(matches[1]!);
+          var last = matches[2]!.isEmpty ? null : _parseRangeValue(matches[2]!);
+          // A range that ends before it starts is invalid, and the Range
+          // header MUST be ignored (RFC 9110 section 14.1.1). The positions
+          // are compared exactly, as values too large for an int are clamped.
+          if (first == null ||
+              last == null ||
+              BigInt.parse(matches[1]!) <= BigInt.parse(matches[2]!)) {
+            // Serve sub-range.
+            int start; // First byte position - inclusive.
+            int end; // Last byte position - inclusive.
+            if (first == null) {
+              // A suffix range, for the last bytes of the file.
+              start = max(0, length - last!);
               end = length - 1;
+            } else {
+              start = first;
+              end = min(last ?? length - 1, length - 1);
             }
-
+            // No byte of the file is in the range, as for a start past the
+            // end or a suffix of no bytes (RFC 9110 section 14.1.1).
             if (start >= length) {
-              response.statusCode = HttpStatus.requestedRangeNotSatisfiable;
+              response
+                ..statusCode = HttpStatus.requestedRangeNotSatisfiable
+                ..headers.set(
+                  HttpHeaders.contentRangeHeader,
+                  'bytes */$length',
+                );
               await response.close();
               return;
             }
@@ -281,8 +311,16 @@ class VirtualDirectory {
         }
       }
     } catch (_) {
-      response.statusCode = HttpStatus.notFound;
-      await response.close();
+      try {
+        response.statusCode = HttpStatus.notFound;
+      } on StateError {
+        // The headers were already sent, so the client disconnected.
+      }
+      try {
+        await response.close();
+      } catch (_) {
+        // The client disconnected, so there is nobody to respond to.
+      }
     }
   }
 
@@ -293,9 +331,39 @@ class VirtualDirectory {
     }
     var response = request.response;
     try {
-      var stats = await dir.stat();
-      if (request.headers.ifModifiedSince != null &&
-          !stats.modified.isAfter(request.headers.ifModifiedSince!)) {
+      // Stat every entry first, so the listing's modification time accounts
+      // for changes to the files in it, not only to the directory itself.
+      var lastModified = (await dir.stat()).modified;
+      var entities = await dir.list(followLinks: true).handleError(
+        (_) {
+          // TODO(kevmoo): log error
+        },
+        // An entry that cannot be read is left out, but a directory that
+        // cannot be listed at all, or any other error, fails the listing.
+        test: (error) =>
+            error is FileSystemException &&
+            (error.path == null || !equals(error.path!, dir.path)),
+      ).toList();
+      var entries = <(FileSystemEntity, FileStat)>[];
+      // Stat the entries in batches, so a large directory neither waits on
+      // each entry in turn nor opens a file handle for every entry at once.
+      for (var i = 0; i < entities.length; i += _statBatchSize) {
+        var batch = entities.sublist(
+          i,
+          min(i + _statBatchSize, entities.length),
+        );
+        var stats = await Future.wait(batch.map(_statOrNull));
+        for (var (index, stat) in stats.indexed) {
+          // The entry was removed while listing, or could not be read.
+          if (stat == null || stat.type == FileSystemEntityType.notFound) {
+            continue;
+          }
+          entries.add((batch[index], stat));
+          if (stat.modified.isAfter(lastModified)) lastModified = stat.modified;
+        }
+      }
+
+      if (_isNotModified(request, lastModified)) {
         response.statusCode = HttpStatus.notModified;
         await response.close();
         return;
@@ -306,8 +374,12 @@ class VirtualDirectory {
         'html',
         parameters: {'charset': 'utf-8'},
       );
-      response.headers.set(HttpHeaders.lastModifiedHeader, stats.modified);
-      var path = Uri.decodeComponent(request.uri.path);
+      response.headers.set(HttpHeaders.lastModifiedHeader, lastModified);
+      if (request.method == 'HEAD') {
+        await response.close();
+        return;
+      }
+      var path = _decodePath(request.uri.path);
       var encodedPath = const HtmlEscape().convert(path);
       var header =
           '''<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
@@ -336,14 +408,13 @@ $server
 
       response.write(header);
 
-      void add(String name, String? modified, var size, bool folder) {
+      void add(String name, String? modified, Object? size, bool folder) {
         size ??= '-';
         modified ??= '';
         var encodedSize = const HtmlEscape().convert(size.toString());
         var encodedModified = const HtmlEscape().convert(modified);
-        var encodedLink = const HtmlEscape(
-          HtmlEscapeMode.attribute,
-        ).convert(Uri.encodeComponent(name));
+        var encodedLink = const HtmlEscape(HtmlEscapeMode.attribute)
+            .convert(Uri.encodeComponent(name));
         if (folder) {
           encodedLink += '/';
           name += '/';
@@ -363,29 +434,29 @@ $server
         add('..', null, null, true);
       }
 
-      dir
-          .list(followLinks: true)
-          .listen(
-            (entity) {
-              var name = basename(entity.path);
-              var stat = entity.statSync();
-              if (entity is File) {
-                add(name, stat.modified.toString(), stat.size, false);
-              } else if (entity is Directory) {
-                add(name, stat.modified.toString(), null, true);
-              }
-            },
-            onError: (e) {
-              // TODO(kevmoo): log error
-            },
-            onDone: () {
-              response.write(footer);
-              response.close();
-            },
-          );
+      for (var (entity, stat) in entries) {
+        var name = basename(entity.path);
+        if (entity is File) {
+          add(name, stat.modified.toString(), stat.size, false);
+        } else if (entity is Directory) {
+          add(name, stat.modified.toString(), null, true);
+        }
+      }
+
+      response.write(footer);
+      await response.close();
     } catch (_) {
       // TODO(kevmoo): log error
-      await response.close();
+      try {
+        response.statusCode = HttpStatus.internalServerError;
+      } on StateError {
+        // Part of the listing was already sent.
+      }
+      try {
+        await response.close();
+      } catch (_) {
+        // The client disconnected, so there is nobody to respond to.
+      }
     }
   }
 
@@ -393,7 +464,13 @@ $server
     var response = request.response;
     response.statusCode = error;
     if (_errorCallback != null) {
-      _errorCallback!(request);
+      var callback = _errorCallback!;
+      _unawaited(
+        Future.sync(() => callback(request)).catchError(
+          // A failing handler must not leave the client waiting.
+          (_) => response.close().catchError((_) {}),
+        ),
+      );
       return;
     }
     response.headers.contentType = ContentType(
@@ -402,7 +479,7 @@ $server
       parameters: {'charset': 'utf-8'},
     );
     // Default error page.
-    var path = Uri.decodeComponent(request.uri.path);
+    var path = _decodePath(request.uri.path);
     var encodedPath = const HtmlEscape().convert(path);
     var encodedReason = const HtmlEscape().convert(response.reasonPhrase);
     var encodedError = const HtmlEscape().convert(error.toString());
@@ -422,7 +499,11 @@ $server
 </body>
 </html>''';
     response.write(page);
-    response.close();
+    _unawaited(
+      response.close().catchError((_) {
+        // The client disconnected, so there is nobody to respond to.
+      }),
+    );
   }
 }
 
@@ -484,6 +565,62 @@ class _VirtualDirectoryFileStream implements StreamConsumer<List<int>> {
     }
   }
 }
+
+/// The location that adds a trailing slash to the directory at [uri].
+///
+/// Only the path and query are kept, and leading slashes are collapsed to one,
+/// so a request like `//other.host/dir` cannot redirect to another host.
+Uri _trailingSlashRedirect(Uri uri) => Uri(
+  path: '/${uri.path.replaceFirst(_leadingSlashes, '')}/',
+  query: uri.hasQuery ? uri.query : null,
+);
+
+final _leadingSlashes = RegExp('^/+');
+
+/// Decodes a request [path] for display, keeping it as it is if its
+/// percent-escapes are not valid UTF-8.
+String _decodePath(String path) {
+  try {
+    return Uri.decodeComponent(path);
+  } on FormatException {
+    return path;
+  }
+}
+
+/// Stats [entity], or returns `null` if it cannot be read.
+Future<FileStat?> _statOrNull(FileSystemEntity entity) async {
+  try {
+    return await entity.stat();
+  } on FileSystemException {
+    return null;
+  }
+}
+
+/// Whether a resource last modified at [modified] is unchanged since the
+/// request's `If-Modified-Since` date.
+///
+/// HTTP dates have a resolution of one second, so [modified] is truncated to
+/// whole seconds before comparing.
+bool _isNotModified(HttpRequest request, DateTime modified) {
+  var since = request.headers.ifModifiedSince;
+  if (since == null) return false;
+  var milliseconds = modified.millisecondsSinceEpoch;
+  // Round down to the second, including for times before 1970.
+  var seconds = milliseconds - milliseconds % 1000;
+  return seconds <= since.millisecondsSinceEpoch;
+}
+
+/// How many directory entries to stat at a time when listing a directory.
+const _statBatchSize = 64;
+
+/// Parses a byte position from a `Range` header, treating a number too large
+/// for an [int] as larger than any file.
+int _parseRangeValue(String value) => int.tryParse(value) ?? 0x7FFFFFFFFFFFFFFF;
+
+/// Completes when [request]'s response is done, or when the client
+/// disconnected before then, so a disconnect is not an uncaught error.
+Future<void> _done(HttpRequest request) =>
+    request.response.done.then((_) {}, onError: (_) {});
 
 // Copied from `package:pedantic` to avoid the dep.
 void _unawaited(Future<void> f) {}
